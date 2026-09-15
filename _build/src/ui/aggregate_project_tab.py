@@ -182,8 +182,17 @@ class _DeleteWorkspaceWorker(QThread):
         self.confirm_unmerged = confirm_unmerged
 
     def run(self) -> None:
-        ok, kept, error = delete_development_workspace(
-            self.plan, confirm_unmerged_backed_up=self.confirm_unmerged,
+        action_log.info("[GUI] 开始删除工作区 workspace=%s", self.plan.workspace.root_path)
+        try:
+            ok, kept, error = delete_development_workspace(
+                self.plan, confirm_unmerged_backed_up=self.confirm_unmerged,
+            )
+        except Exception as exc:
+            action_log.exception("[GUI] 删除工作区异常 workspace=%s", self.plan.workspace.root_path)
+            ok, kept, error = False, (), f"删除未完成：{exc}"
+        action_log.info(
+            "[GUI] 工作区清理结果 workspace=%s ok=%s remaining=%s error=%s",
+            self.plan.workspace.root_path, ok, kept, error,
         )
         self.done.emit(ok, kept, error)
 
@@ -1241,7 +1250,7 @@ class AggregateProjectTab(QWidget):
             )
         lines.extend([
             "",
-            "继续后将按以下顺序执行：",
+            "继续后将分别清理以下内容，一项失败不阻止其他项：",
             f"1. 递归删除整个工作区目录：{plan.workspace.root_path}",
             "2. 删除为该工作区创建的本地任务分支",
             "3. 删除远程仓库中的同名任务分支",

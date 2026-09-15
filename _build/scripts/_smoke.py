@@ -1119,6 +1119,29 @@ def development_workspace_lifecycle_check() -> list[str]:
             if not delete_plan.can_delete:
                 failed.append(f"merged clean workspace should be deletable: {delete_plan.blockers!r}")
             else:
+                # An occupied directory must not prevent local or remote branch
+                # cleanup, even while the Worktree files still exist.
+                from unittest.mock import patch
+                with patch.object(service.shutil, "rmtree", side_effect=PermissionError("occupied directory")):
+                    occupied_ok, occupied_kept, occupied_error = service.delete_development_workspace(delete_plan)
+                if occupied_ok or occupied_kept or not Path(workspace.root_path).exists():
+                    failed.append(f"occupied directory result incorrect: {occupied_error}; {occupied_kept!r}")
+                for component in workspace.components:
+                    if component.mode != "worktree":
+                        continue
+                    if service._run_git(component.source_repository_path,
+                        ["show-ref", "--verify", "--quiet", f"refs/heads/{component.task_branch}"], 10)[0] != 1:
+                        failed.append(f"occupied directory retained local branch: {component.task_branch}")
+                    if service._run_git(component.source_repository_path,
+                        ["ls-remote", "--heads", "origin", f"refs/heads/{component.task_branch}"], 30)[1]:
+                        failed.append(f"occupied directory retained remote branch: {component.task_branch}")
+                    # Restore only the temporary fixture's branches for the
+                    # normal deletion case below; the Worktree is now detached.
+                    for args in (["branch", component.task_branch, "HEAD"],
+                                 ["push", "origin", component.task_branch]):
+                        restore_code, restore_out, restore_err = service._run_git(component.worktree_path, args, 30)
+                        if restore_code:
+                            failed.append(f"delete fixture restoration failed: {restore_err or restore_out}")
                 ok, kept, error = service.delete_development_workspace(delete_plan)
                 if not ok or error or Path(workspace.root_path).exists():
                     failed.append(f"safe workspace deletion failed: {error}; kept={kept!r}")

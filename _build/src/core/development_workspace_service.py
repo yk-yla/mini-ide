@@ -1352,14 +1352,35 @@ def delete_development_workspace(
     remaining_branches: list[str] = []
     try:
         root = canonical_path(fresh_plan.workspace.root_path)
+        errors: list[str] = []
+        # Detach each owned Worktree before removing files. Git otherwise refuses
+        # to delete its checked-out branch when an occupied directory survives.
+        for item in fresh_plan.workspace.components:
+            if item.mode != "worktree":
+                continue
+            code, branch, _err = _run_git(
+                item.worktree_path, ["symbolic-ref", "--quiet", "HEAD"], 10,
+            )
+            if code == 0 and branch == f"refs/heads/{item.task_branch}":
+                code, commit, err = _run_git(
+                    item.worktree_path, ["rev-parse", "--verify", "HEAD"], 10,
+                )
+                if code == 0:
+                    code, _out, err = _run_git(
+                        item.worktree_path,
+                        ["update-ref", "--no-deref", "HEAD", commit], 10,
+                    )
+                if code != 0:
+                    errors.append(f"{item.id} 解除目录与分支的关联失败：{err}")
+        directory_error = ""
         try:
             if root.exists():
                 shutil.rmtree(root, onerror=_remove_readonly_path)
         except OSError as exc:
-            return False, (), f"删除工作区目录失败：{exc}"
+            directory_error = f"工作区目录未删完：{root}；{exc}"
+            errors.append(directory_error)
 
         statuses = {item.id: item for item in fresh_plan.components}
-        errors: list[str] = []
         pruned_repositories: set[str] = set()
         for item in fresh_plan.workspace.components:
             if item.mode != "worktree":
@@ -1375,7 +1396,7 @@ def delete_development_workspace(
                     errors.append(err or out or f"清理 {item.id} Worktree 记录失败")
                 pruned_repositories.add(repo_key)
 
-            code, _out, _err = _run_git(
+            code, _out, ref_error = _run_git(
                 item.source_repository_path,
                 ["show-ref", "--verify", "--quiet", f"refs/heads/{item.task_branch}"],
                 10,
@@ -1386,7 +1407,10 @@ def delete_development_workspace(
                 )
                 if delete_code != 0:
                     remaining_branches.append(item.task_branch)
-                    errors.append(err or out or f"删除本地分支失败：{item.task_branch}")
+                    errors.append(f"本地分支 {item.task_branch} 删除失败：{err or out}")
+            elif code != 1:
+                remaining_branches.append(item.task_branch)
+                errors.append(f"本地分支 {item.task_branch} 检查失败：{ref_error}")
 
             status = statuses[item.id]
             remote_remaining, remote_errors = _delete_remote_task_branches(
@@ -1399,7 +1423,9 @@ def delete_development_workspace(
             return (
                 False,
                 tuple(dict.fromkeys(remaining_branches)),
-                "工作区目录已删除，但分支清理未完成：" + "；".join(dict.fromkeys(errors)),
+                ("目录清理未完成。" if directory_error else "工作区目录已删除。")
+                + ("部分分支未删完。" if remaining_branches else "本地和远程任务分支均已删除。")
+                + "\n" + "；".join(dict.fromkeys(errors)),
             )
         return True, (), ""
     finally:
