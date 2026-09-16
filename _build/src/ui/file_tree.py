@@ -1077,14 +1077,8 @@ class FileTree(QWidget):
             self._apply_filter(self.filter_input.text())
 
     def _open_codex(self, target_dir: Path) -> None:
-        """在 AgentDesk 中为 codex 入口打开当前目录。"""
+        """使用资源管理器 open gpt 的打开方式打开当前目录。"""
         command = open_in_codex_args(target_dir)
-        if not command:
-            QMessageBox.warning(
-                self, "启动 AgentDesk 失败",
-                "没有找到 AgentDesk，请先安装或配置 AGENTDESK_EXE。",
-            )
-            return
         try:
             subprocess.Popen(
                 command,
@@ -1093,7 +1087,7 @@ class FileTree(QWidget):
                 close_fds=True,
             )
         except OSError as e:
-            QMessageBox.warning(self, "启动 AgentDesk 失败", f"{e}")
+            QMessageBox.warning(self, "启动 open gpt 失败", f"{e}")
 
     def _open_cc(self, target_dir: Path) -> None:
         """在 AgentDesk 中为 cc 入口打开当前目录。"""

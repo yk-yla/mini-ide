@@ -5,6 +5,7 @@ import os
 import shutil
 import winreg
 from pathlib import Path
+from urllib.parse import quote
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -87,8 +88,12 @@ def open_in_agentdesk_args(target_dir: Path, provider: str = "") -> list[str]:
 
 
 def open_in_codex_args(target_dir: Path) -> list[str]:
-    """Open the codex entry in AgentDesk."""
-    return open_in_agentdesk_args(target_dir, "codex")
+    """Use the same desktop deep link as Explorer's open gpt action."""
+    return [
+        str(Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "rundll32.exe"),
+        "url.dll,FileProtocolHandler",
+        f"codex://threads/new?path={quote(str(target_dir), safe='')}",
+    ]
 
 
 def open_in_cc_args(target_dir: Path) -> list[str]:

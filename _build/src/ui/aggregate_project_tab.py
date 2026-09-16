@@ -429,7 +429,7 @@ class AggregateProjectTab(QWidget):
         self.project_codex_button = QPushButton("codex")
         self.project_codex_button.setObjectName("external_tool_button")
         self.project_codex_button.setMinimumWidth(58)
-        self.project_codex_button.setToolTip("在 AgentDesk 中打开当前代码环境")
+        self.project_codex_button.setToolTip("使用 open gpt 打开当前代码环境")
         self.project_codex_button.clicked.connect(self._open_current_in_codex)
         progress_row.addWidget(self.project_codex_button)
         self.project_cc_button = QPushButton("cc")
@@ -932,7 +932,7 @@ class AggregateProjectTab(QWidget):
             else self.aggregate_project.root_path
         )
 
-    def _open_external_tool(self, target: Path, command: list[str]) -> None:
+    def _open_external_tool(self, target: Path, command: list[str], tool_name: str = "AgentDesk") -> None:
         if not command:
             QMessageBox.warning(
                 self, "启动 AgentDesk 失败",
@@ -944,11 +944,11 @@ class AggregateProjectTab(QWidget):
                 command, cwd=str(target), creationflags=CREATE_NO_WINDOW, close_fds=True,
             )
         except OSError as exc:
-            QMessageBox.warning(self, "启动 AgentDesk 失败", str(exc))
+            QMessageBox.warning(self, f"启动 {tool_name} 失败", str(exc))
 
     def _open_current_in_codex(self) -> None:
         target = self._current_environment_root()
-        self._open_external_tool(target, open_in_codex_args(target))
+        self._open_external_tool(target, open_in_codex_args(target), "open gpt")
 
     def _open_current_in_cc(self) -> None:
         target = self._current_environment_root()
@@ -958,7 +958,7 @@ class AggregateProjectTab(QWidget):
         summary = self._selected_workspace_summary()
         if summary and summary.workspace is not None:
             target = Path(summary.workspace.root_path)
-            self._open_external_tool(target, open_in_codex_args(target))
+            self._open_external_tool(target, open_in_codex_args(target), "open gpt")
 
     def _open_selected_in_cc(self) -> None:
         summary = self._selected_workspace_summary()

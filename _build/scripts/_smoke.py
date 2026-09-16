@@ -353,14 +353,15 @@ def cli_output_encoding_check() -> list[str]:
 
 
 def external_launcher_check() -> list[str]:
-    """验证 AgentDesk 入口使用参数数组且保留目标目录。"""
+    """验证桌面应用入口保留目标目录。"""
     import os
     import tempfile
+    from urllib.parse import parse_qs, urlsplit
 
     from src.core import tool_launchers
 
     failed: list[str] = []
-    target = Path(r"E:\race workspace\certificate")
+    target = Path(r"E:\race workspace\中文 & certificate#1%")
     original_executable = os.environ.get("AGENTDESK_EXE")
     with tempfile.TemporaryDirectory() as temporary:
         executable = Path(temporary) / "AgentDesk.exe"
@@ -379,8 +380,15 @@ def external_launcher_check() -> list[str]:
     base = [str(executable), "--", "--cwd", str(target)]
     if agentdesk_args != base:
         failed.append("AgentDesk launcher must separate Electron arguments and preserve the target directory")
-    if codex_args != [*base, "--provider=codex"]:
-        failed.append("codex entry must launch the codex provider in AgentDesk")
+    link = urlsplit(codex_args[-1])
+    if (
+        Path(codex_args[0]).name.lower() != "rundll32.exe"
+        or codex_args[1] != "url.dll,FileProtocolHandler"
+        or (link.scheme, link.netloc, link.path) != ("codex", "threads", "/new")
+        or parse_qs(link.query) != {"path": [str(target)]}
+        or link.fragment
+    ):
+        failed.append("codex entry must match open gpt and preserve the target directory")
     if cc_args != [*base, "--provider=claude"]:
         failed.append("cc entry must launch the Claude provider in AgentDesk")
     if tool_launchers.CREATE_NO_WINDOW != 0x08000000:
@@ -390,7 +398,7 @@ def external_launcher_check() -> list[str]:
         for msg in failed:
             print(f"[FAIL] external_launcher: {msg}", flush=True)
     else:
-        print("[OK]   AgentDesk external launcher", flush=True)
+        print("[OK]   Desktop external launchers", flush=True)
     return failed
 
 
