@@ -31,6 +31,7 @@ from src.core.target_resolver import (
 from src.core.service_state import (
     STATE_RUNNING_EXTERNAL, STATE_RUNNING_MANAGED,
 )
+from src.core.search_worker_lifecycle import stop_search_workers
 from src.ui.empty_state import EmptyState
 from src.ui.aggregate_project_tab import AggregateProjectTab
 from src.ui.project_tab import ProjectTab
@@ -38,6 +39,7 @@ from src.util import app_log, notify
 from src.util.editor import open_folder
 
 log = app_log.get_logger("main_window")
+perf_log = app_log.get_logger("performance")
 
 
 def _restored_tab_index(entries: list[str], saved_index: int) -> int:
@@ -156,6 +158,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setObjectName("main_tabs")
         self.tabs.setDocumentMode(True)
+        self._restoring_tabs = False
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
@@ -765,6 +768,11 @@ class MainWindow(QMainWindow):
                     self._quit_requested = False
                     e.ignore()
                     return
+        if not stop_search_workers():
+            self._quit_requested = False
+            e.ignore()
+            log.error("搜索线程未能在退出前停止，已取消退出")
+            return
         self._persist_geometry()
         self._persist_tabs()
         self.config.save()
@@ -857,6 +865,8 @@ class MainWindow(QMainWindow):
 
     def _save_tab_session(self) -> None:
         """Tab 增删、切换、拖动后立即保存，避免异常退出时恢复旧会话。"""
+        if self._restoring_tabs:
+            return
         self._persist_tabs()
         self.config.save()
 
@@ -864,7 +874,11 @@ class MainWindow(QMainWindow):
         """事件循环起来后的收尾：先恢复上次会话，再打开命令行传入的初始项目。"""
         if (self.config.startup_restore_mode in {"workspace", "last_session"}
               and self.config.restore_tabs_on_startup and self.config.active_tabs):
-            self._restore_tabs()
+            self._restore_tabs(self._finish_startup)
+            return
+        self._finish_startup()
+
+    def _finish_startup(self) -> None:
         if self.pending_initial_project:
             self.open_project(self.pending_initial_project)
             self.pending_initial_project = None
@@ -884,34 +898,67 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
-    def _restore_tabs(self) -> None:
+    def _restore_tabs(self, on_done=None) -> None:
         entries, target_index = _normalized_tab_session(
             list(self.config.active_tabs),
             self.config.active_tab_index,
             self.config.aggregate_project_paths,
         )
         if not entries:
+            if on_done:
+                on_done()
             return
         log.info("恢复 Tab 会话: %d 个", len(entries))
+        started = time.perf_counter()
+        self._restoring_tabs = True
+        next_index = 0
         opened = 0
-        for token in entries:
+
+        def finish() -> None:
+            if opened and target_index < self.tabs.count():
+                self.tabs.setCurrentIndex(target_index)
+            self._restoring_tabs = False
+            self._save_tab_session()
+            perf_log.info(
+                "perf op=session-restore duration_ms=%.1f files=%d status=done",
+                (time.perf_counter() - started) * 1000, opened,
+            )
+            if on_done:
+                on_done()
+
+        def restore_next() -> None:
+            nonlocal next_index, opened
+            if next_index >= len(entries):
+                finish()
+                return
+            token = entries[next_index]
+            next_index += 1
+            item_started = time.perf_counter()
             kind, _, key = token.partition(":")
             if not key or kind not in {"project", "aggregate", "development"}:
-                continue
-            try:
-                if Path(key).is_dir():
-                    if kind == "aggregate":
-                        tab = self.open_aggregate_project(key)
-                    elif kind == "development":
-                        tab = self.open_development_workspace(key)
+                status = "skipped"
+            else:
+                status = "done"
+                try:
+                    if Path(key).is_dir():
+                        if kind == "aggregate":
+                            tab = self.open_aggregate_project(key)
+                        elif kind == "development":
+                            tab = self.open_development_workspace(key)
+                        else:
+                            tab = self.open_project(key)
+                        if tab is not None:
+                            opened += 1
                     else:
-                        tab = self.open_project(key)
-                    if tab is not None:
-                        opened += 1
-                else:
-                    log.warning("跳过不存在的项目: %s", key)
-            except Exception:
-                log.exception("恢复 Tab 失败: %s", token)
+                        status = "skipped"
+                        log.warning("跳过不存在的项目: %s", key)
+                except Exception:
+                    status = "failed"
+                    log.exception("恢复 Tab 失败: %s", token)
+            perf_log.info(
+                "perf op=session-restore-item duration_ms=%.1f files=1 status=%s",
+                (time.perf_counter() - item_started) * 1000, status,
+            )
+            QTimer.singleShot(10, restore_next)
 
-        if opened and target_index < self.tabs.count():
-            self.tabs.setCurrentIndex(target_index)
+        QTimer.singleShot(0, restore_next)

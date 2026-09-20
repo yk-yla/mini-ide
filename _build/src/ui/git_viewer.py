@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 
@@ -22,21 +23,43 @@ from src.ui.theme import (
 )
 from src.util.editor import REVEAL_LABEL, reveal_in_explorer
 
-WORKER_CLOSE_WAIT_MS = 16000
+perf_log = logging.getLogger("mini-ide.performance")
+
+
+def _overview_signature(
+    root: str, branch: str, files: list[git_ops.ChangedFile],
+) -> str:
+    parts = [branch]
+    for changed in files:
+        abs_path = Path(root) / changed.path
+        try:
+            st = abs_path.stat()
+            stamp = f"{st.st_mtime_ns}:{st.st_size}"
+        except OSError:
+            stamp = "-"
+        parts.append(f"{changed.status}:{changed.path}:{stamp}")
+    return "\n".join(parts)
 
 
 class _OverviewWorker(QThread):
-    done = Signal(str, list, dict)  # branch, changed files, numstat
+    done = Signal(str, str, list, dict, str)  # root, branch, files, numstat, signature
 
     def __init__(self, root: str, parent=None):
         super().__init__(parent)
         self.root = root
 
     def run(self) -> None:
-        branch = git_ops.current_branch(self.root)
-        files = git_ops.list_changed_files(self.root)
-        stats = git_ops.diff_numstat(self.root)
-        self.done.emit(branch, files, stats)
+        started = time.perf_counter()
+        root = git_ops.repo_root(self.root)
+        branch = git_ops.current_branch(root)
+        files = git_ops.list_changed_files(root)
+        stats = git_ops.diff_numstat(root)
+        signature = _overview_signature(root, branch, files)
+        perf_log.info(
+            "perf op=git-overview-worker duration_ms=%.1f files=%d status=done",
+            (time.perf_counter() - started) * 1000, len(files),
+        )
+        self.done.emit(root, branch, files, stats, signature)
 
 
 class _FileDiffWorker(QThread):
@@ -48,8 +71,13 @@ class _FileDiffWorker(QThread):
         self.changed_file = changed_file
 
     def run(self) -> None:
+        started = time.perf_counter()
         f = self.changed_file
         text = git_context.file_diff_text(self.root, f)
+        perf_log.info(
+            "perf op=git-diff-worker duration_ms=%.1f files=1 status=done",
+            (time.perf_counter() - started) * 1000,
+        )
         self.done.emit(f.path, text)
 
 
@@ -97,7 +125,7 @@ class GitViewer(QDialog):
     def __init__(self, project_root: str, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.root = git_ops.repo_root(project_root)
+        self.root = project_root
         self.setWindowTitle(f"Git 改动 — {self.root}")
         self.resize(1120, 720)
         self._overview_worker: _OverviewWorker | None = None
@@ -191,18 +219,6 @@ class GitViewer(QDialog):
             return GIT_DEL
         return GIT_MODIFY
 
-    def _signature(self, branch: str, files: list[git_ops.ChangedFile]) -> str:
-        parts = [branch]
-        for f in files:
-            abs_path = Path(self.root) / f.path
-            try:
-                st = abs_path.stat()
-                stamp = f"{st.st_mtime_ns}:{st.st_size}"
-            except OSError:
-                stamp = "-"
-            parts.append(f"{f.status}:{f.path}:{stamp}")
-        return "\n".join(parts)
-
     def _sort_files(self, files: list[git_ops.ChangedFile]) -> list[git_ops.ChangedFile]:
         return git_context.sort_changed_files(files)
 
@@ -228,8 +244,10 @@ class GitViewer(QDialog):
 
     def _load_changes(self, files: list[git_ops.ChangedFile]) -> None:
         current_path = self._selected_path
+        self.changes_list.setUpdatesEnabled(False)
         self.changes_list.clear()
         if not files:
+            self.changes_list.setUpdatesEnabled(True)
             self.diff_view.setPlainText("(工作区很干净，无改动)")
             self._selected_path = ""
             return
@@ -248,6 +266,7 @@ class GitViewer(QDialog):
             self.changes_list.addItem(item)
             if f.path == current_path:
                 target_row = self.changes_list.count() - 1
+        self.changes_list.setUpdatesEnabled(True)
         self.changes_list.setCurrentRow(target_row)
 
     def _on_change_selected(self, current, _prev) -> None:
@@ -321,18 +340,29 @@ class GitViewer(QDialog):
         self._track_worker(worker)
         worker.start()
 
-    def _on_overview_loaded(self, branch: str, files: list[git_ops.ChangedFile], stats: dict) -> None:
+    def _on_overview_loaded(
+        self, root: str, branch: str, files: list[git_ops.ChangedFile],
+        stats: dict, signature: str,
+    ) -> None:
         if self._closing:
             return
         if self.sender() is not self._overview_worker:
             return
+        started = time.perf_counter()
         self._overview_worker = None
+        self.root = root
+        self.setWindowTitle(f"Git 改动 — {self.root}")
         self._numstat = stats
         self._update_header(branch, files)
-        signature = self._signature(branch, files)
         if signature != self._last_signature:
             self._last_signature = signature
             self._load_changes(files)
+        duration_ms = (time.perf_counter() - started) * 1000
+        if duration_ms >= 20:
+            perf_log.info(
+                "perf op=git-overview-render duration_ms=%.1f files=%d status=done",
+                duration_ms, len(files),
+            )
 
     def _track_worker(self, worker: QThread) -> None:
         self._active_workers.append(worker)
@@ -351,5 +381,5 @@ class GitViewer(QDialog):
         self._refresh_timer.stop()
         for worker in list(self._active_workers):
             if worker.isRunning():
-                worker.wait(WORKER_CLOSE_WAIT_MS)
+                worker.requestInterruption()
         super().closeEvent(event)

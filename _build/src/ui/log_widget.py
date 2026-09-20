@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+from collections import deque
+import logging
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -44,6 +46,10 @@ from src.ui.theme import (
     COLOR_SQL, COLOR_SUCCESS, COLOR_WARN,
     FG_DIM, FG_PRIMARY, FG_SECONDARY, apply_search_style,
 )
+
+
+LOG_FLUSH_BATCH_SIZE = 500
+perf_log = logging.getLogger("mini-ide.performance")
 
 
 # ---- 每行附带的分类数据 ----
@@ -82,7 +88,7 @@ class LogWidget(QWidget):
 
         # 批量刷新：高吞吐日志（如 Gradle 初扫）会飙到 1000+行/秒，
         # 单行 insert 会卡主线程。把接收到的行先塞到队列，每 50ms 集中写入一次。
-        self._pending: list[tuple[str, str]] = []
+        self._pending: deque[tuple[str, str]] = deque()
         self._flush_timer = QTimer(self)
         self._flush_timer.setInterval(50)
         self._flush_timer.timeout.connect(self._flush_pending)
@@ -333,8 +339,11 @@ class LogWidget(QWidget):
         if not self._pending:
             self._flush_timer.stop()
             return
-        batch = self._pending
-        self._pending = []
+        started = time.perf_counter()
+        batch = [
+            self._pending.popleft()
+            for _ in range(min(LOG_FLUSH_BATCH_SIZE, len(self._pending)))
+        ]
 
         # 插入前采样：用户当前是否贴在底部。只有贴底时才在 flush 后自动跟随到
         # 最新——否则用户往上翻看历史会被每 50ms 一次的 flush 反复拽回底部。
@@ -389,6 +398,12 @@ class LogWidget(QWidget):
                 self._persistent_fh.flush()
             except OSError:
                 pass
+        duration_ms = (time.perf_counter() - started) * 1000
+        if duration_ms >= 100:
+            perf_log.warning(
+                "perf op=log-render duration_ms=%.1f files=%d status=slow",
+                duration_ms, len(batch),
+            )
 
     def clear(self) -> None:
         if self._flush_timer.isActive():

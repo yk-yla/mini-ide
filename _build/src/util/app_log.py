@@ -38,6 +38,8 @@ _initialized = False
 _logger: logging.Logger | None = None
 _heartbeat = 0.0
 _freeze_watchdog_started = False
+_performance_tick = 0.0
+_performance_last_warned = 0.0
 
 
 def init() -> logging.Logger:
@@ -100,6 +102,20 @@ def heartbeat() -> None:
     """主线程心跳：卡死检测器用这个判断主线程是否还在响应"""
     global _heartbeat
     _heartbeat = time.time()
+
+
+def performance_heartbeat(interval_ms: int = 100, stall_ms: int = 250) -> None:
+    """记录亚秒级 UI 事件循环延迟，不采集用户输入或文件内容。"""
+    global _performance_tick, _performance_last_warned
+    now = time.perf_counter()
+    if _performance_tick:
+        delay_ms = max(0.0, (now - _performance_tick) * 1000 - interval_ms)
+        if delay_ms >= stall_ms and now - _performance_last_warned >= 2.0:
+            _performance_last_warned = now
+            logging.getLogger("mini-ide.performance").warning(
+                "perf op=ui-stall duration_ms=%.1f status=warn", delay_ms,
+            )
+    _performance_tick = now
 
 
 def log_path_today() -> Path:

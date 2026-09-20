@@ -20,6 +20,7 @@
 - 逻辑层：`_build/src/core/`；界面层：`_build/src/ui/`；工具层：`_build/src/util/`。
 - GUI 入口：`_build/main.py`；CLI 入口：`_build/cli_main.py`。
 - 长期运行模型和多技术栈扩展基线见 [docs/runtime-units.md](docs/runtime-units.md)；涉及项目识别、服务生命周期、GUI 或 CLI 的改动先对照该文档。
+- 性能优化基线、阶段计划和验收标准见 [docs/performance.md](docs/performance.md)；涉及扫描、索引、搜索、主线程或大数据量渲染的改动先对照该文档。
 - 发布文件：根目录 `mini-ide.exe`、`mini-ide-cli.exe`、`mini-ide-runtime/`。
 - 打包脚本：`_build\scripts\build.bat`。
 - 冒烟测试：在 `_build` 目录运行 `poetry run python scripts/_smoke.py`。

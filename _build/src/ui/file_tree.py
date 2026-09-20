@@ -6,7 +6,10 @@
 """
 from __future__ import annotations
 
+import logging
+import os
 import subprocess
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QFile, QMimeData, QThread, QTimer, QUrl, Signal
@@ -22,6 +25,8 @@ from src.core.git_ops import (
     GIT_STATUS_MODIFIED, GIT_STATUS_UNTRACKED,
 )
 from src.core.file_actions import paste_paths
+from src.core.file_index import FileSearchWorker
+from src.core.search_worker_lifecycle import register_search_worker
 from src.core.tool_launchers import (
     CREATE_NO_WINDOW, open_in_cc_args, open_in_codex_args,
 )
@@ -64,7 +69,6 @@ QTreeWidget::branch:has-children:!has-siblings:closed,
 QTreeWidget::branch:closed:has-children:has-siblings {{
     image: none;
     border-image: none;
-    background: url(x);
 }}
 """
 
@@ -76,6 +80,7 @@ _CUT_MIME = "application/x-mini-ide-cut"
 # 节点级 git 染色缓存：(color_hex, strikethrough, tooltip)，
 # 染色函数对比缓存值，相同则不调 setForeground/setFont/setToolTip，避免 viewport 误重绘
 _RENDER_CACHE_ROLE = Qt.ItemDataRole.UserRole + 2
+perf_log = logging.getLogger("mini-ide.performance")
 
 
 class _PasteWorker(QThread):
@@ -91,6 +96,44 @@ class _PasteWorker(QThread):
         target_dir = Path(self._target_dir)
         changed, failed = paste_paths([Path(raw) for raw in self._sources], target_dir, self._move)
         self.done.emit(str(target_dir), changed, failed, self._move)
+
+
+class _DirectoryLoadWorker(QThread):
+    done = Signal(str, int, list, float)  # path, generation, entries, scan_ms
+
+    def __init__(self, path: str, generation: int, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self.generation = generation
+
+    def run(self) -> None:
+        started = time.perf_counter()
+        dirs: list[tuple[str, str, str]] = []
+        files: list[tuple[str, str, str]] = []
+        try:
+            with os.scandir(self.path) as scan:
+                for entry in scan:
+                    if self.isInterruptionRequested():
+                        return
+                    if entry.name in _ALWAYS_HIDDEN:
+                        continue
+                    try:
+                        if entry.is_dir():
+                            dirs.append(("dir", entry.name, entry.path))
+                        elif entry.is_file():
+                            files.append(("file", entry.name, entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        dirs.sort(key=lambda item: item[1].lower())
+        files.sort(key=lambda item: item[1].lower())
+        duration_ms = (time.perf_counter() - started) * 1000
+        perf_log.info(
+            "perf op=directory-scan duration_ms=%.1f files=%d status=done",
+            duration_ms, len(dirs) + len(files),
+        )
+        self.done.emit(self.path, self.generation, dirs + files, duration_ms)
 
 
 class _MultiSelectTree(QTreeWidget):
@@ -146,6 +189,21 @@ class FileTree(QWidget):
         self.indexer = indexer
         self.project_type = project_type
         self._paste_workers: list[_PasteWorker] = []
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(120)
+        self._filter_timer.timeout.connect(self._run_filter)
+        self._pending_filter_text = ""
+        self._search_generation = 0
+        self._search_workers: list[FileSearchWorker] = []
+        self._directory_generation: dict[str, int] = {}
+        self._directory_workers: list[_DirectoryLoadWorker] = []
+        self._directory_loading: set[str] = set()
+        self._pending_expanded_paths: set[str] = set()
+        self._pending_scroll_pos = 0
+        self._pending_reveal_path = ""
+        self._expand_all_pending = False
+        self._expand_all_queue: list[QTreeWidgetItem] = []
         # git 状态：{rel_posix_path: status_kind}，status_kind 为 GIT_STATUS_* 之一
         self._git_status: dict[str, str] = {}
         self._git_ignored: set[str] = set()
@@ -212,8 +270,7 @@ class FileTree(QWidget):
             parent_path = self.root_path if not parent_rel else self.root_path / parent_rel
             node = self._find_node_by_path(self.tree.invisibleRootItem(), str(parent_path))
             if node is not None:
-                if not (node.childCount() == 1
-                        and node.child(0).text(0) == "(loading...)"):
+                if not self._has_loading_placeholder(node):
                     self._refresh_dir_node(parent_path)
 
         # 4) 颜色：迭代刷整棵已加载子树（栈替代递归，避免 Python 函数调用开销）
@@ -264,18 +321,33 @@ class FileTree(QWidget):
             remainder = remainder[1:]
         if not remainder:
             return
-        rel_parts = Path(remainder).parts
         # 确保显示的是树视图而非搜索列表
         if self.stack.currentWidget() is not self.tree:
             self.filter_input.clear()
-        # 树结构：invisibleRootItem → 项目根节点 → 子目录/文件
-        # 从项目根节点开始搜索
+        self._pending_reveal_path = file_path
+        self._continue_reveal_path()
+
+    def _continue_reveal_path(self) -> None:
+        """逐层等待目录 worker，完成异步文件定位。"""
+        file_path = self._pending_reveal_path
+        if not file_path:
+            return
+        remainder = file_path[len(str(self.root_path)):]
+        if remainder.startswith(("\\", "/")):
+            remainder = remainder[1:]
+        rel_parts = Path(remainder).parts
         root_node = self.tree.topLevelItem(0)
         if root_node is None:
+            self._pending_reveal_path = ""
             return
         self.tree.expandItem(root_node)
         node = root_node
-        for part in rel_parts:
+        for index, part in enumerate(rel_parts):
+            if self._has_loading_placeholder(node):
+                path = node.data(0, Qt.ItemDataRole.UserRole)
+                if path:
+                    self._start_directory_load(node, Path(path))
+                return
             found = None
             part_lower = part.lower()
             for i in range(node.childCount()):
@@ -285,13 +357,15 @@ class FileTree(QWidget):
                     found = child
                     break
             if found is None:
+                self._pending_reveal_path = ""
                 return
-            # 触发懒加载
-            if found.childCount() == 1 and found.child(0).text(0) == "(loading...)":
-                found.removeChild(found.child(0))
-                self._populate_children(found, Path(found.data(0, Qt.ItemDataRole.UserRole)))
-            self.tree.expandItem(found)
+            if index < len(rel_parts) - 1:
+                if found.data(0, Qt.ItemDataRole.UserRole + 1) != "dir":
+                    self._pending_reveal_path = ""
+                    return
+                self.tree.expandItem(found)
             node = found
+        self._pending_reveal_path = ""
         self.tree.setCurrentItem(node)
         self.tree.scrollToItem(node)
 
@@ -408,19 +482,17 @@ class FileTree(QWidget):
     def _reload(self) -> None:
         # 保存展开状态 + 滚动位置，重建后恢复，避免每次刷新整个树都收起来
         expanded = self._collect_expanded(self.tree.invisibleRootItem())
-        scroll_pos = self.tree.verticalScrollBar().value()
+        self._pending_expanded_paths = set(expanded)
+        self._pending_scroll_pos = self.tree.verticalScrollBar().value()
+        self._cancel_expand_all()
 
         self.tree.clear()
         root_item = QTreeWidgetItem([self.root_path.name])
         root_item.setData(0, Qt.ItemDataRole.UserRole, str(self.root_path))
         root_item.setData(0, Qt.ItemDataRole.UserRole + 1, "dir")
         self.tree.addTopLevelItem(root_item)
-        self._populate_children(root_item, self.root_path)
+        self._start_directory_load(root_item, self.root_path, force=True)
         self.tree.expandItem(root_item)
-
-        if expanded:
-            self._apply_expanded(root_item, expanded)
-            self.tree.verticalScrollBar().setValue(scroll_pos)
 
     def _collect_expanded(self, root_item: QTreeWidgetItem) -> set[str]:
         """收集当前所有处于展开状态的目录节点的绝对路径"""
@@ -437,31 +509,91 @@ class FileTree(QWidget):
         return out
 
     def _apply_expanded(self, root_item: QTreeWidgetItem, paths: set[str]) -> None:
-        """对路径在 paths 集合里的目录节点逐个 expand（会触发懒加载）"""
+        """恢复当前已加载层的展开状态，后续层由目录 worker 回调继续。"""
+        own_path = root_item.data(0, Qt.ItemDataRole.UserRole)
+        if own_path:
+            paths.discard(own_path)
+
         def walk(item: QTreeWidgetItem) -> None:
             for i in range(item.childCount()):
                 ch = item.child(i)
                 if ch.data(0, Qt.ItemDataRole.UserRole + 1) == "dir":
                     p = ch.data(0, Qt.ItemDataRole.UserRole)
                     if p in paths:
+                        paths.discard(p)
                         self.tree.expandItem(ch)
-                        walk(ch)
+                        if not self._has_loading_placeholder(ch):
+                            walk(ch)
         walk(root_item)
 
-    def _populate_children(self, parent_item: QTreeWidgetItem, parent_path: Path) -> None:
-        """加载直接子项。目录带懒加载占位符。"""
-        try:
-            entries = list(parent_path.iterdir())
-        except OSError:
+    @staticmethod
+    def _has_loading_placeholder(item: QTreeWidgetItem) -> bool:
+        return (
+            item.childCount() == 1
+            and item.child(0).data(0, Qt.ItemDataRole.UserRole + 1) == "loading"
+        )
+
+    def _start_directory_load(
+        self, parent_item: QTreeWidgetItem, parent_path: Path, *, force: bool = False,
+    ) -> None:
+        path = str(parent_path)
+        if path in self._directory_loading and not force:
             return
-        dirs = sorted(
-            [p for p in entries if p.is_dir() and p.name not in _ALWAYS_HIDDEN],
-            key=lambda p: p.name.lower(),
+        generation = self._directory_generation.get(path, 0) + 1
+        self._directory_generation[path] = generation
+        self._directory_loading.add(path)
+        parent_item.takeChildren()
+        placeholder = QTreeWidgetItem(["正在加载..."])
+        placeholder.setData(0, Qt.ItemDataRole.UserRole + 1, "loading")
+        parent_item.addChild(placeholder)
+        worker = _DirectoryLoadWorker(
+            path, generation, parent=QApplication.instance(),
         )
-        files = sorted(
-            [p for p in entries if p.is_file() and p.name not in _ALWAYS_HIDDEN],
-            key=lambda p: p.name.lower(),
+        self._directory_workers.append(worker)
+        worker.done.connect(self._on_directory_loaded)
+        worker.finished.connect(self._on_directory_worker_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_directory_worker_finished(self) -> None:
+        worker = self.sender()
+        try:
+            self._directory_workers.remove(worker)
+        except ValueError:
+            pass
+
+    def _on_directory_loaded(
+        self, path: str, generation: int, entries: list, _scan_ms: float,
+    ) -> None:
+        if generation != self._directory_generation.get(path):
+            return
+        self._directory_loading.discard(path)
+        parent_item = self._find_node_by_path(
+            self.tree.invisibleRootItem(), path,
         )
+        if parent_item is None:
+            return
+        started = time.perf_counter()
+        self._render_directory_entries(parent_item, Path(path), entries)
+        duration_ms = (time.perf_counter() - started) * 1000
+        perf_log.info(
+            "perf op=directory-render duration_ms=%.1f files=%d status=done",
+            duration_ms, len(entries),
+        )
+        if self._pending_expanded_paths:
+            self._apply_expanded(parent_item, self._pending_expanded_paths)
+            self.tree.verticalScrollBar().setValue(self._pending_scroll_pos)
+        if self._pending_reveal_path:
+            self._continue_reveal_path()
+        if self._expand_all_pending:
+            self._queue_loaded_directories(parent_item)
+            QTimer.singleShot(0, self._expand_all_step)
+
+    def _render_directory_entries(
+        self, parent_item: QTreeWidgetItem, parent_path: Path,
+        entries: list[tuple[str, str, str]],
+    ) -> None:
+        """在主线程批量挂载 worker 返回的直接子项。"""
         # 预算 parent rel：避免对每个子项重复 relative_to
         try:
             parent_rel = str(parent_path.relative_to(self.root_path)).replace("\\", "/")
@@ -471,21 +603,24 @@ class FileTree(QWidget):
             parent_rel = ""
         prefix = (parent_rel + "/") if parent_rel else ""
 
-        for d in dirs:
-            node = QTreeWidgetItem(["📁  " + d.name])
-            node.setData(0, Qt.ItemDataRole.UserRole, str(d))
-            node.setData(0, Qt.ItemDataRole.UserRole + 1, "dir")
-            node.addChild(QTreeWidgetItem(["(loading...)"]))
-            self._apply_git_color_to_node(node, d, rel=prefix + d.name)
-            parent_item.addChild(node)
-        for f in files:
-            node = QTreeWidgetItem(["  " + f.name])
-            node.setData(0, Qt.ItemDataRole.UserRole, str(f))
-            node.setData(0, Qt.ItemDataRole.UserRole + 1, "file")
-            self._apply_git_color_to_node(node, f, rel=prefix + f.name)
-            parent_item.addChild(node)
+        nodes: list[QTreeWidgetItem] = []
+        existing_names: set[str] = set()
+        for kind, name, abs_path in entries:
+            existing_names.add(name.lower())
+            if kind == "dir":
+                node = QTreeWidgetItem(["📁  " + name])
+                loading = QTreeWidgetItem(["(loading...)"])
+                loading.setData(0, Qt.ItemDataRole.UserRole + 1, "loading")
+                node.addChild(loading)
+            else:
+                node = QTreeWidgetItem(["  " + name])
+            node.setData(0, Qt.ItemDataRole.UserRole, abs_path)
+            node.setData(0, Qt.ItemDataRole.UserRole + 1, kind)
+            self._apply_git_color_to_node(
+                node, Path(abs_path), rel=prefix + name,
+            )
+            nodes.append(node)
         # git 已删除文件：磁盘上读不到，需要在父目录下补占位行
-        existing_names = {d.name.lower() for d in dirs} | {f.name.lower() for f in files}
         for name in self._git_deleted_by_parent.get(parent_rel, []):
             # 避免与磁盘上同名条目重复（理论上不会，但 rename 等极端情况兜底）
             if name.lower() in existing_names:
@@ -503,13 +638,18 @@ class FileTree(QWidget):
             flags &= ~Qt.ItemFlag.ItemIsDragEnabled
             flags &= ~Qt.ItemFlag.ItemIsEditable
             node.setFlags(flags)
-            parent_item.addChild(node)
+            nodes.append(node)
+        self.tree.setUpdatesEnabled(False)
+        try:
+            parent_item.takeChildren()
+            parent_item.addChildren(nodes)
+        finally:
+            self.tree.setUpdatesEnabled(True)
 
     def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
-        if item.childCount() == 1 and item.child(0).text(0) == "(loading...)":
-            item.removeChild(item.child(0))
+        if self._has_loading_placeholder(item):
             path = Path(item.data(0, Qt.ItemDataRole.UserRole))
-            self._populate_children(item, path)
+            self._start_directory_load(item, path)
 
     _STATUS_COLORS = {
         GIT_STATUS_CONFLICT: GIT_CONFLICT,
@@ -620,7 +760,7 @@ class FileTree(QWidget):
             item, abs_str = stack.pop()
             kind = item.data(0, Qt.ItemDataRole.UserRole + 1)
             if kind == "deleted":
-                # 删除占位节点的颜色在 _populate_children 时已经设好，无需刷
+                # 删除占位节点在目录批量渲染时已经设好颜色，无需刷新
                 continue
             # 计算 rel：剥离 root 前缀，比 Path.relative_to 快得多
             if abs_str == root_path_str:
@@ -634,7 +774,7 @@ class FileTree(QWidget):
             cc = item.childCount()
             if cc == 0:
                 continue
-            if cc == 1 and item.child(0).text(0) == "(loading...)":
+            if self._has_loading_placeholder(item):
                 continue
             for i in range(cc):
                 child = item.child(i)
@@ -646,27 +786,57 @@ class FileTree(QWidget):
                     stack.append((child, child_abs))
 
     def _expand_all_safe(self) -> None:
-        """展开全部前先把所有懒加载节点都加载一遍"""
-        self._eagerly_load_all(self.tree.invisibleRootItem())
-        self.tree.expandAll()
+        """逐个异步加载目录并展开，避免一次阻塞主线程。"""
+        self._cancel_expand_all()
+        top = self.tree.topLevelItem(0)
+        if top is None:
+            return
+        self._expand_all_pending = True
+        self._expand_all_queue.append(top)
+        QTimer.singleShot(0, self._expand_all_step)
 
-    def _eagerly_load_all(self, node: QTreeWidgetItem) -> None:
-        # 触发当前节点的懒加载
-        if node.childCount() == 1 and node.child(0).text(0) == "(loading...)":
-            node.removeChild(node.child(0))
-            path_str = node.data(0, Qt.ItemDataRole.UserRole)
-            if path_str:
-                self._populate_children(node, Path(path_str))
-        for i in range(node.childCount()):
-            child = node.child(i)
-            if child.data(0, Qt.ItemDataRole.UserRole + 1) == "dir":
-                self._eagerly_load_all(child)
+    def _cancel_expand_all(self) -> None:
+        self._expand_all_pending = False
+        self._expand_all_queue.clear()
+
+    def _queue_loaded_directories(self, node: QTreeWidgetItem) -> None:
+        queued_paths = {
+            item.data(0, Qt.ItemDataRole.UserRole)
+            for item in self._expand_all_queue
+        }
+        for index in range(node.childCount()):
+            child = node.child(index)
+            if child.data(0, Qt.ItemDataRole.UserRole + 1) != "dir":
+                continue
+            path = child.data(0, Qt.ItemDataRole.UserRole)
+            if path and path not in queued_paths:
+                queued_paths.add(path)
+                self._expand_all_queue.append(child)
+
+    def _expand_all_step(self) -> None:
+        if not self._expand_all_pending:
+            return
+        if not self._expand_all_queue:
+            self._expand_all_pending = False
+            return
+        node = self._expand_all_queue.pop(0)
+        self.tree.expandItem(node)
+        if self._has_loading_placeholder(node):
+            path = node.data(0, Qt.ItemDataRole.UserRole)
+            if path:
+                self._start_directory_load(node, Path(path))
+                return
+        self._queue_loaded_directories(node)
+        QTimer.singleShot(0, self._expand_all_step)
 
     # ---- 过滤 ----
 
     def _apply_filter(self, text: str) -> None:
+        self._pending_filter_text = text
+        self._filter_timer.stop()
         text = text.strip()
         if not text:
+            self._cancel_file_search()
             self.stack.setCurrentWidget(self.tree)
             return
         if self.indexer is None:
@@ -674,20 +844,66 @@ class FileTree(QWidget):
             self.stack.setCurrentWidget(self.tree)
             self._filter_tree(self.tree.invisibleRootItem(), text.lower())
             return
-        # 有 FileIndexer：切换到扁平结果列表，全项目搜
+        # 有 FileIndexer：防抖后在后台做全项目模糊匹配。
+        self._cancel_file_search()
         self.stack.setCurrentWidget(self.search_list)
+        self._filter_timer.start()
+
+    def _run_filter(self) -> None:
+        text = self._pending_filter_text.strip()
+        if not text or self.indexer is None:
+            return
+        self._cancel_file_search()
+        generation = self._search_generation
+        worker = FileSearchWorker(
+            self.indexer.files(), text, 300, generation,
+            parent=QApplication.instance(),
+        )
+        self._search_workers.append(worker)
+        register_search_worker(worker, worker.requestInterruption)
+        worker.result.connect(self._on_filter_results)
+        worker.finished.connect(self._on_filter_worker_finished)
+        worker.finished.connect(worker.deleteLater)
         self.search_list.clear()
-        hits = self.indexer.search(text, limit=300)
+        placeholder = QListWidgetItem("搜索中...")
+        placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.search_list.addItem(placeholder)
+        worker.start()
+
+    def _cancel_file_search(self) -> None:
+        self._search_generation += 1
+        for worker in self._search_workers:
+            if worker.isRunning():
+                worker.requestInterruption()
+
+    def _on_filter_results(self, generation: int, hits: list, _duration_ms: float) -> None:
+        if generation != self._search_generation:
+            return
+        worker = self.sender()
+        if (self.filter_input.text().strip() != self._pending_filter_text.strip()
+                or getattr(worker, "query", "").strip() != self._pending_filter_text.strip()):
+            return
+        self.search_list.setUpdatesEnabled(False)
+        self.search_list.clear()
         if not hits:
             ph = QListWidgetItem(f"(无匹配)  共索引 {self.indexer.count()} 个文件")
             ph.setFlags(Qt.ItemFlag.NoItemFlags)
             ph.setForeground(Qt.GlobalColor.darkGray)
             self.search_list.addItem(ph)
+            self.search_list.setUpdatesEnabled(True)
             return
-        for f in hits:
-            item = QListWidgetItem(f"  {f.name_original}\n    {f.rel_path}")
-            item.setData(Qt.ItemDataRole.UserRole, f.abs_path)
-            self.search_list.addItem(item)
+        try:
+            for f in hits:
+                item = QListWidgetItem(f"  {f.name_original}\n    {f.rel_path}")
+                item.setData(Qt.ItemDataRole.UserRole, f.abs_path)
+                self.search_list.addItem(item)
+        finally:
+            self.search_list.setUpdatesEnabled(True)
+
+    def _on_filter_worker_finished(self) -> None:
+        worker = self.sender()
+        if worker in self._search_workers:
+            self._search_workers.remove(worker)
 
     def _filter_tree(self, item: QTreeWidgetItem, text: str) -> bool:
         any_visible = False
@@ -1076,6 +1292,20 @@ class FileTree(QWidget):
         if self.stack.currentWidget() is self.search_list:
             self._apply_filter(self.filter_input.text())
 
+    def closeEvent(self, event) -> None:
+        self.stop_workers()
+        super().closeEvent(event)
+
+    def stop_workers(self) -> None:
+        """停止当前控件发起的可中断后台任务，不在主线程等待。"""
+        self._filter_timer.stop()
+        self._cancel_file_search()
+        self._pending_reveal_path = ""
+        self._cancel_expand_all()
+        for worker in self._directory_workers:
+            if worker.isRunning():
+                worker.requestInterruption()
+
     def _open_codex(self, target_dir: Path) -> None:
         """使用资源管理器 open gpt 的打开方式打开当前目录。"""
         command = open_in_codex_args(target_dir)
@@ -1183,12 +1413,9 @@ class FileTree(QWidget):
             return
         # 保存子树展开状态
         sub_expanded = self._collect_expanded(node)
-        # 清掉子项重新填充
-        node.takeChildren()
-        self._populate_children(node, dir_path)
+        self._pending_expanded_paths.update(sub_expanded)
+        self._start_directory_load(node, dir_path, force=True)
         node.setExpanded(True)
-        if sub_expanded:
-            self._apply_expanded(node, sub_expanded)
 
     def _find_node_by_path(self, parent: QTreeWidgetItem, target: str) -> QTreeWidgetItem | None:
         for i in range(parent.childCount()):
@@ -1198,7 +1425,7 @@ class FileTree(QWidget):
                 return child
             if child.data(0, Qt.ItemDataRole.UserRole + 1) == "dir":
                 # 仅递归到已加载（非懒加载占位）的目录里找
-                if not (child.childCount() == 1 and child.child(0).text(0) == "(loading...)"):
+                if not self._has_loading_placeholder(child):
                     found = self._find_node_by_path(child, target)
                     if found:
                         return found

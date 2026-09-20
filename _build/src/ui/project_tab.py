@@ -19,9 +19,11 @@ from PySide6.QtWidgets import (
 from src.core.config import AppConfig, ProjectEntry
 from src.core.file_index import FileIndexer
 from src.core.git_worker import (
-    GitCheckoutRemoteWorker, GitCheckoutWorker, GitDeleteLocalBranchWorker,
-    GitFetchWorker, GitMergePushWorker, GitStatusWorker,
+    GitBranchListWorker, GitCheckoutRemoteWorker, GitCheckoutWorker,
+    GitDeleteLocalBranchWorker, GitDirtyCheckWorker, GitFetchWorker,
+    GitMergePushWorker, GitStatusWorker,
 )
+from src.core.nginx_detector import detect_nginx
 from src.core.process_runner import ProcessRunner, RunContext
 from src.core.project_detector import ProjectMeta, RunProfile
 from src.core.service_state import (
@@ -71,6 +73,7 @@ COMPILE_THEN_RUN_GAP_MS = 300
 
 log = logging.getLogger("mini-ide")
 action_log = logging.getLogger("mini-ide.action")  # 操作行为日志，统一写到同一日志文件
+perf_log = logging.getLogger("mini-ide.performance")
 
 
 # 状态栏分支/改动按钮保持紧凑，但必须有明确按钮边界。
@@ -163,8 +166,8 @@ class ProjectTab(QWidget):
 
         # 是否 git 仓库：启动时判一次缓存住。非 git 项目不起染色/状态栏 worker，
         # 省得每 3s 白跑一堆注定失败的 git 子进程。
-        from src.core.git_ops import is_git_repo
-        self._is_git_repo = is_git_repo(meta.path)
+        from src.core.git_ops import has_git_metadata
+        self._is_git_repo = has_git_metadata(meta.path)
 
         # 项目级 runner：单模块项目的启动用它；多模块项目用它跑编译/Clean 等全局 profile
         self.runner = ProcessRunner(self)
@@ -207,6 +210,11 @@ class ProjectTab(QWidget):
         # 待重启的 profile：stop() 后不靠固定延时赌进程已退，而是在 _on_finished
         # （进程真正退出）里消费它再启动，避免慢停止导致重复弹框 / 定时器叠加。
         self._pending_restart: RunProfile | None = None
+        self._git_branch_worker: GitBranchListWorker | None = None
+        self._git_dirty_worker: GitDirtyCheckWorker | None = None
+        self._pending_checkout: tuple[bool, str] | None = None
+        self._branch_data: dict | None = None
+        self._checkout_target = ""
         self._git_fetch_worker: GitFetchWorker | None = None
         self._git_checkout_worker: GitCheckoutWorker | None = None
         self._git_checkout_remote_worker: GitCheckoutRemoteWorker | None = None
@@ -231,15 +239,21 @@ class ProjectTab(QWidget):
         # 状态轮询（运行时长、占用端口、内存）
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(STATUS_REFRESH_MS)
-        self._poll_timer.timeout.connect(self._refresh_status_row)
-        self._poll_timer.start()
+        self._poll_timer.timeout.connect(self._poll_status_if_visible)
+        timer_offset = sum(ord(char) for char in self.project_meta.path) % 800
+        self._poll_start_timer = QTimer(self)
+        self._poll_start_timer.setSingleShot(True)
+        self._poll_start_timer.timeout.connect(self._start_status_polling)
+        self._poll_start_timer.start(250 + timer_offset)
 
         # 远程分支轮询：每 5 分钟 git fetch 一次，发现新提交时高亮分支按钮
         self._fetch_timer = QTimer(self)
         self._fetch_timer.setInterval(GIT_FETCH_INTERVAL_MS)
         self._fetch_timer.timeout.connect(self._start_remote_fetch)
-        self._fetch_timer.start()
-        QTimer.singleShot(GIT_FETCH_INITIAL_DELAY_MS, self._start_remote_fetch)
+        self._fetch_start_timer = QTimer(self)
+        self._fetch_start_timer.setSingleShot(True)
+        self._fetch_start_timer.timeout.connect(self._start_fetch_polling)
+        self._fetch_start_timer.start(GIT_FETCH_INITIAL_DELAY_MS + timer_offset * 5)
 
     # ---- UI ----
 
@@ -1666,7 +1680,6 @@ class ProjectTab(QWidget):
         return self._external_detector.detect(port_snapshot())
 
     def _detect_nginx_status(self):
-        from src.core.nginx_detector import detect_nginx
         from src.core.process_runner import port_snapshot
         self._nginx_status = detect_nginx(self.project_meta.path, port_snapshot())
         return self._nginx_status
@@ -1730,6 +1743,33 @@ class ProjectTab(QWidget):
                     self._module_ports[mod_name] = port
             else:
                 self._module_external_pids.pop(mod_name, None)
+
+    def _start_status_polling(self) -> None:
+        if self.isVisible():
+            self._refresh_status_row()
+        self._poll_timer.start()
+
+    def _poll_status_if_visible(self) -> None:
+        if not self.isVisible():
+            return
+        started = time.perf_counter()
+        self._refresh_status_row()
+        duration_ms = (time.perf_counter() - started) * 1000
+        if duration_ms >= 50:
+            perf_log.warning(
+                "perf op=status-poll duration_ms=%.1f status=slow",
+                duration_ms,
+            )
+
+    def _start_fetch_polling(self) -> None:
+        if not self._is_git_repo:
+            return
+        self._start_remote_fetch()
+        self._fetch_timer.start()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self._poll_status_if_visible)
 
     def _refresh_status_row(self) -> None:
         if self._is_multi_module:
@@ -1883,12 +1923,19 @@ class ProjectTab(QWidget):
     def _on_git_status_done(
         self, statuses: dict, ignored: set, deleted_by_parent: dict, info,
     ) -> None:
+        started = time.perf_counter()
         log.debug(
             f"[git_colors] statuses={len(statuses)}, "
             f"ignored={len(ignored)}, deleted_groups={len(deleted_by_parent)}"
         )
         self._render_git_status_row(info)
         self.file_tree.update_git_status(statuses, ignored, deleted_by_parent)
+        duration_ms = (time.perf_counter() - started) * 1000
+        if duration_ms >= 20:
+            perf_log.info(
+                "perf op=git-status-render duration_ms=%.1f files=%d status=done",
+                duration_ms, len(statuses),
+            )
         # 本轮结束：只在仍是当前 worker 时清引用（避免极端时序下把刚起的新 worker 误置空）。
         # 对象本身由 finished→deleteLater 回收，这里不碰 C++ 生命周期。
         if self.sender() is self._git_status_worker:
@@ -2056,6 +2103,7 @@ class ProjectTab(QWidget):
                 return
             key = self._tab_key(widget.get_path())
             self._file_panes.pop(key, None)
+            widget.stop_workers()
         self.center_tabs.removeTab(index)
         widget.deleteLater()
 
@@ -2133,19 +2181,36 @@ class ProjectTab(QWidget):
     # ---- 分支操作 ----
 
     def _populate_branch_menu(self) -> None:
-        """每次菜单弹出前重建：本地分支点击切换，右键复制。"""
-        from src.core.git_ops import is_git_repo, list_branches
+        """菜单先显示加载态，分支列表由 worker 返回后再填充。"""
         menu = self._branch_menu
         menu.clear()
-        if not is_git_repo(self.project_meta.path):
+        if not self._is_git_repo:
             act = menu.addAction("（不是 git 仓库）")
             act.setEnabled(False)
             return
+        act = menu.addAction("正在加载分支...")
+        act.setEnabled(False)
+        if self._git_branch_worker and self._git_branch_worker.isRunning():
+            return
+        worker = GitBranchListWorker(self.project_meta.path, parent=self)
+        worker.done.connect(self._on_branch_list_done)
+        worker.finished.connect(worker.deleteLater)
+        self._git_branch_worker = worker
+        worker.start()
 
-        data = list_branches(self.project_meta.path)
-        cur = data["current"]
-        local = data["local"]
-        remote = data["remote"]
+    def _on_branch_list_done(self, data: dict) -> None:
+        if self.sender() is not self._git_branch_worker:
+            return
+        self._git_branch_worker = None
+        self._branch_data = data
+        self._render_branch_menu(data)
+
+    def _render_branch_menu(self, data: dict) -> None:
+        menu = self._branch_menu
+        menu.clear()
+        cur = str(data.get("current", "") or "")
+        local = list(data.get("local", []))
+        remote = list(data.get("remote", []))
         menu.set_current_branch(cur)
 
         menu.addAction("🔀 合并远程分支到当前", self._show_merge_dialog)
@@ -2179,8 +2244,7 @@ class ProjectTab(QWidget):
 
     def _manual_fetch_remote(self) -> None:
         """用户手动刷新远程分支：fetch 完成后重新弹出菜单。"""
-        from src.core.git_ops import is_git_repo
-        if not is_git_repo(self.project_meta.path):
+        if not self._is_git_repo:
             return
         if self._git_fetch_worker and self._git_fetch_worker.isRunning():
             return
@@ -2205,11 +2269,12 @@ class ProjectTab(QWidget):
         """后台静默 git fetch，刷新 ahead/behind 状态，发现远程领先时高亮分支按钮。"""
         if self._git_fetch_worker and self._git_fetch_worker.isRunning():
             return
-        from src.core.git_ops import has_upstream, is_git_repo
         path = self.project_meta.path
-        if not is_git_repo(path) or not has_upstream(path):
+        if not self._is_git_repo:
             return
-        self._git_fetch_worker = GitFetchWorker(path, parent=self)
+        self._git_fetch_worker = GitFetchWorker(
+            path, parent=self, require_upstream=True,
+        )
         self._git_fetch_worker.done.connect(self._on_remote_fetch_done)
         self._git_fetch_worker.finished.connect(self._git_fetch_worker.deleteLater)
         self._git_fetch_worker.start()
@@ -2223,9 +2288,34 @@ class ProjectTab(QWidget):
         self._refresh_status_row()
 
     def _do_checkout(self, branch: str) -> None:
-        from src.core.git_ops import is_dirty
-        path = self.project_meta.path
-        if is_dirty(path):
+        self._check_dirty_before_checkout(False, branch)
+
+    def _do_checkout_remote_branch(self, remote_branch: str) -> None:
+        self._check_dirty_before_checkout(True, remote_branch)
+
+    def _check_dirty_before_checkout(self, remote: bool, branch: str) -> None:
+        if ((self._git_dirty_worker and self._git_dirty_worker.isRunning())
+                or (self._git_checkout_worker and self._git_checkout_worker.isRunning())
+                or (self._git_checkout_remote_worker
+                    and self._git_checkout_remote_worker.isRunning())):
+            return
+        self._pending_checkout = (remote, branch)
+        worker = GitDirtyCheckWorker(self.project_meta.path, parent=self)
+        worker.done.connect(self._on_checkout_dirty_checked)
+        worker.finished.connect(worker.deleteLater)
+        self._git_dirty_worker = worker
+        worker.start()
+
+    def _on_checkout_dirty_checked(self, dirty: bool) -> None:
+        if self.sender() is not self._git_dirty_worker:
+            return
+        self._git_dirty_worker = None
+        pending = self._pending_checkout
+        self._pending_checkout = None
+        if pending is None:
+            return
+        remote, branch = pending
+        if dirty:
             ret = QMessageBox.question(
                 self, "切换分支",
                 f"本地有未提交的改动，仍要切换到 {branch} 吗？",
@@ -2234,12 +2324,27 @@ class ProjectTab(QWidget):
             )
             if ret != QMessageBox.StandardButton.Yes:
                 return
-        if self._git_checkout_worker and self._git_checkout_worker.isRunning():
-            return
-        self._git_checkout_worker = GitCheckoutWorker(path, branch, parent=self)
-        self._git_checkout_worker.done.connect(self._on_checkout_done)
-        self._git_checkout_worker.finished.connect(self._git_checkout_worker.deleteLater)
-        self._git_checkout_worker.start()
+        self._start_checkout(remote, branch)
+
+    def _start_checkout(self, remote: bool, branch: str) -> None:
+        path = self.project_meta.path
+        if remote:
+            if (self._git_checkout_remote_worker
+                    and self._git_checkout_remote_worker.isRunning()):
+                return
+            worker = GitCheckoutRemoteWorker(path, branch, parent=self)
+            worker.done.connect(self._on_checkout_remote_done)
+            worker.finished.connect(worker.deleteLater)
+            self._git_checkout_remote_worker = worker
+        else:
+            if self._git_checkout_worker and self._git_checkout_worker.isRunning():
+                return
+            worker = GitCheckoutWorker(path, branch, parent=self)
+            worker.done.connect(self._on_checkout_done)
+            worker.finished.connect(worker.deleteLater)
+            self._git_checkout_worker = worker
+        self._checkout_target = branch
+        worker.start()
 
     def _on_checkout_done(self, ok: bool, msg: str) -> None:
         if self.sender() is self._git_checkout_worker:
@@ -2247,30 +2352,12 @@ class ProjectTab(QWidget):
         git_info.invalidate(self.project_meta.path)
         self._refresh_status_row()
         if ok:
-            info = git_info.get_info(self.project_meta.path)
-            branch = info.branch if info else ""
-            notify.notify_success("分支已切换", f"当前分支：{branch}")
+            target = self._checkout_target
+            self._checkout_target = ""
+            notify.notify_success("分支已切换", f"当前分支：{target}")
         else:
+            self._checkout_target = ""
             QMessageBox.warning(self, "切换失败", msg)
-
-    def _do_checkout_remote_branch(self, remote_branch: str) -> None:
-        from src.core.git_ops import is_dirty
-        path = self.project_meta.path
-        if is_dirty(path):
-            ret = QMessageBox.question(
-                self, "切换分支",
-                f"本地有未提交的改动，仍要切换到 {remote_branch} 吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
-                return
-        if self._git_checkout_remote_worker and self._git_checkout_remote_worker.isRunning():
-            return
-        self._git_checkout_remote_worker = GitCheckoutRemoteWorker(path, remote_branch, parent=self)
-        self._git_checkout_remote_worker.done.connect(self._on_checkout_remote_done)
-        self._git_checkout_remote_worker.finished.connect(self._git_checkout_remote_worker.deleteLater)
-        self._git_checkout_remote_worker.start()
 
     def _on_checkout_remote_done(self, ok: bool, msg: str) -> None:
         if self.sender() is self._git_checkout_remote_worker:
@@ -2278,10 +2365,13 @@ class ProjectTab(QWidget):
         git_info.invalidate(self.project_meta.path)
         self._refresh_status_row()
         if ok:
-            info = git_info.get_info(self.project_meta.path)
-            branch = info.branch if info else ""
-            notify.notify_success("分支已切换", f"当前分支：{branch}")
+            target = self._checkout_target
+            if "/" in target:
+                target = target.split("/", 1)[1]
+            self._checkout_target = ""
+            notify.notify_success("分支已切换", f"当前分支：{target}")
         else:
+            self._checkout_target = ""
             QMessageBox.warning(self, "切换失败", msg)
 
     def _do_delete_local_branch(self, branch: str) -> None:
@@ -2312,13 +2402,12 @@ class ProjectTab(QWidget):
             QMessageBox.warning(self, "删除失败", msg)
 
     def _show_merge_dialog(self) -> None:
-        from src.core.git_ops import current_branch, list_remote_branches
-        path = self.project_meta.path
-        remotes = list_remote_branches(path)
+        data = self._branch_data or {}
+        remotes = list(data.get("remote", []))
         if not remotes:
             QMessageBox.information(self, "合并", "没有找到远程分支。")
             return
-        cur = current_branch(path)
+        cur = str(data.get("current", "") or "")
         items = [PickerItem(title=b, subtitle="", data=b) for b in remotes]
         from src.ui.quick_open import PickerDialog
         dlg = PickerDialog(f"合并远程分支到当前（{cur}）", self)
@@ -2412,15 +2501,21 @@ class ProjectTab(QWidget):
                 return False
         self._poll_timer.stop()
         self._fetch_timer.stop()
+        self._poll_start_timer.stop()
+        self._fetch_start_timer.stop()
+        for pane in self._file_panes.values():
+            pane.stop_workers()
         self.indexer.stop()
-        # 等可能在跑的 git worker 收尾：它们 parent 到 self，tab 关闭后 self 随
-        # GC 销毁，若某 QThread 仍在运行会触发「QThread destroyed while still
-        # running」崩溃。都很短命，给个短超时等一下即可。
-        for w in (self._git_status_worker, self._git_fetch_worker,
+        self.file_tree.stop_workers()
+        # Git 子进程可能受磁盘或网络影响。关闭 Tab 时把 worker 转交给应用回收，
+        # 不在 UI 线程逐个 wait；接收者销毁后 Qt 会自动断开结果信号。
+        for w in (self._git_branch_worker, self._git_dirty_worker,
+                  self._git_status_worker, self._git_fetch_worker,
                   self._git_checkout_worker, self._git_checkout_remote_worker,
                   self._git_delete_branch_worker, self._git_merge_worker):
             if w is not None and w.isRunning():
-                w.wait(2000)
+                w.requestInterruption()
+                w.setParent(QApplication.instance())
         return True
 
     # ---- 快捷键与导航 ----
@@ -2446,18 +2541,30 @@ class ProjectTab(QWidget):
     def open_file_picker(self) -> None:
         """Ctrl+Shift+N：弹独立浮窗按文件名搜（IDEA 风格），回车在中心区打开"""
         from src.ui.quick_open import show_file_picker
+        started = time.perf_counter()
         dlg = show_file_picker(
             self.indexer,
             on_pick=lambda p: self._show_preview(p, 0, 0),
             parent=self,
         )
         dlg.show()
+        perf_log.info(
+            "perf op=file-search-open duration_ms=%.1f files=%d status=done",
+            (time.perf_counter() - started) * 1000, self.indexer.count(),
+        )
 
     def open_content_search(self) -> None:
         """Ctrl+Shift+F：在当前项目内搜索文件内容。"""
-        dlg = ContentSearchDialog(self.project_meta.path, parent=self)
+        started = time.perf_counter()
+        dlg = ContentSearchDialog(
+            self.project_meta.path, parent=self, indexer=self.indexer,
+        )
         dlg.open_requested.connect(lambda p, l, c: self._show_preview(p, l, c))
         dlg.show()
+        perf_log.info(
+            "perf op=content-search-open duration_ms=%.1f files=%d status=done",
+            (time.perf_counter() - started) * 1000, self.indexer.count(),
+        )
 
     def open_recent_files(self) -> None:
         if not self._recent_files:
@@ -2518,8 +2625,7 @@ class ProjectTab(QWidget):
         dlg.show()
 
     def open_git_viewer(self) -> None:
-        from src.core.git_ops import is_git_repo
-        if not is_git_repo(self.project_meta.path):
+        if not self._is_git_repo:
             QMessageBox.information(self, "Git", "当前项目不是 git 仓库")
             return
         if self._git_viewer is not None:

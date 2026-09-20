@@ -12,8 +12,7 @@ from typing import Callable
 
 from PySide6.QtCore import Qt, QEvent, QSize, QTimer, Signal
 from PySide6.QtGui import (
-    QAbstractTextDocumentLayout, QColor, QIcon, QKeyEvent, QPalette,
-    QTextDocument,
+    QColor, QFont, QFontMetrics, QIcon, QKeyEvent, QPalette,
 )
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -21,74 +20,89 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from src.core.file_index import FileSearchWorker
+from src.core.search_worker_lifecycle import register_search_worker
 from src.ui.theme import (
     ACCENT, ACCENT_SUBTLE, BG_CODE, BG_L1, BG_L2, BG_L4,
     BORDER_STRONG, BORDER_SUBTLE, FG_BRIGHT, FG_DIM, FG_PRIMARY, FG_SECONDARY,
-    FONT_PT_UI, FONT_PT_UI_LG, FONT_PT_UI_SM, RADIUS_SM, apply_search_style,
+    FONT_PT_UI, FONT_PT_UI_LG, FONT_PT_UI_SM, RADIUS_SM, TREE_ITEM_PAD_V,
+    apply_search_style,
 )
 
 
-def _esc(s: str) -> str:
-    """HTML 转义，避免文件名/路径里的 < & 破坏富文本渲染"""
-    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-
-
 class _PickerItemDelegate(QStyledItemDelegate):
-    """候选项两段式渲染：标题（文件名）亮色加粗，副标题（路径）暗色小字。
+    """单行绘制标题和路径，长文本省略显示，不允许换行挤压相邻项。"""
 
-    之前 title + "\\n  " + subtitle 拼成纯文本一把渲染，全白同字号，
-    一搜满屏白字根本扫不出文件名。这里用 QTextDocument 渲染富文本，
-    让文件名跳出来、路径退到背景。
-    """
+    _LINE_GAP = TREE_ITEM_PAD_V
 
-    def _build_doc(self, index, selected: bool) -> QTextDocument | None:
+    @staticmethod
+    def _item(index):
         it = index.data(Qt.ItemDataRole.UserRole)
-        if it is None or not isinstance(it, PickerItem):
-            return None
-        title = _esc(it.title)
-        sub = _esc(it.subtitle) if it.subtitle else ""
-        # 选中态标题用纯白，普通态用主色；路径恒用暗色
-        title_color = FG_BRIGHT if selected else FG_PRIMARY
-        html = (f'<span style="color:{title_color}; font-size:{FONT_PT_UI}pt;'
-                f' font-weight:600;">{title}</span>')
-        if sub:
-            html += (f'<br/><span style="color:{FG_DIM};'
-                     f' font-size:{FONT_PT_UI_SM}pt;">{sub}</span>')
-        doc = QTextDocument()
-        doc.setDocumentMargin(0)
-        doc.setHtml(html)
-        return doc
+        return it if isinstance(it, PickerItem) else None
+
+    @staticmethod
+    def _fonts(base_font: QFont) -> tuple[QFont, QFont]:
+        title_font = QFont(base_font)
+        title_font.setPointSizeF(FONT_PT_UI)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        subtitle_font = QFont(base_font)
+        subtitle_font.setPointSizeF(FONT_PT_UI_SM)
+        return title_font, subtitle_font
 
     def paint(self, painter, option, index):
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         selected = bool(opt.state & QStyle.StateFlag.State_Selected)
-        doc = self._build_doc(index, selected)
-        if doc is None:
+        item = self._item(index)
+        if item is None:
             super().paint(painter, option, index)
             return
-        # 背景（hover/选中）走默认主题绘制，文字我们自己画
+
         opt.text = ""
         widget = opt.widget
         style = widget.style() if widget else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
         text_rect = style.subElementRect(
             QStyle.SubElement.SE_ItemViewItemText, opt, widget)
+
+        title_font, subtitle_font = self._fonts(opt.font)
+        title_metrics = QFontMetrics(title_font)
+        subtitle_metrics = QFontMetrics(subtitle_font)
+        content_height = title_metrics.height()
+        if item.subtitle:
+            content_height += self._LINE_GAP + subtitle_metrics.height()
+        top = text_rect.top() + max(0, (text_rect.height() - content_height) // 2)
+        width = max(0, text_rect.width())
+
         painter.save()
-        painter.translate(text_rect.topLeft())
-        painter.setClipRect(0, 0, text_rect.width(), text_rect.height())
-        doc.setTextWidth(text_rect.width())
-        ctx = QAbstractTextDocumentLayout.PaintContext()
-        doc.documentLayout().draw(painter, ctx)
+        painter.setClipRect(text_rect)
+        painter.setFont(title_font)
+        painter.setPen(QColor(FG_BRIGHT if selected else FG_PRIMARY))
+        painter.drawText(
+            text_rect.left(), top + title_metrics.ascent(),
+            title_metrics.elidedText(item.title, Qt.TextElideMode.ElideRight, width),
+        )
+        if item.subtitle:
+            subtitle_top = top + title_metrics.height() + self._LINE_GAP
+            painter.setFont(subtitle_font)
+            painter.setPen(QColor(FG_SECONDARY if selected else FG_DIM))
+            painter.drawText(
+                text_rect.left(), subtitle_top + subtitle_metrics.ascent(),
+                subtitle_metrics.elidedText(
+                    item.subtitle, Qt.TextElideMode.ElideMiddle, width,
+                ),
+            )
         painter.restore()
 
     def sizeHint(self, option, index):
-        doc = self._build_doc(index, False)
-        if doc is None:
+        if self._item(index) is None:
             return super().sizeHint(option, index)
-        w = option.rect.width() if option.rect.width() > 0 else 600
-        doc.setTextWidth(w)
-        return QSize(int(doc.idealWidth()), int(doc.size().height()) + 8)
+        title_font, subtitle_font = self._fonts(option.font)
+        item = self._item(index)
+        height = QFontMetrics(title_font).height() + TREE_ITEM_PAD_V * 2
+        if item.subtitle:
+            height += self._LINE_GAP + QFontMetrics(subtitle_font).height()
+        return QSize(0, height)
 
 
 @dataclass
@@ -136,19 +150,22 @@ class PickerDialog(QDialog):
         self.list.setStyleSheet(
             f"QListWidget {{ background:{BG_L1}; color:{FG_PRIMARY};"
             f" border:1px solid {BORDER_STRONG}; border-top:none; outline:none; }}"
-            f"QListWidget::item {{ padding:6px 12px; border:none; }}"
+            f"QListWidget::item {{ padding:0 12px; border:none; }}"
             f"QListWidget::item:hover {{ background:{BG_L4}; }}"
             f"QListWidget::item:selected {{ background:{ACCENT_SUBTLE};"
             f" color:{FG_BRIGHT}; }}"
         )
         self.list.itemActivated.connect(self._on_activated)
         self.list.installEventFilter(self)
-        # 富文本 delegate：文件名亮+加粗、路径暗+小字（替代纯文本同字号同色渲染）
+        # 标题和路径各占一行，长文本省略，避免换行挤压相邻项。
         self.list.setItemDelegate(_PickerItemDelegate(self.list))
         root.addWidget(self.list, 1)
 
         self._fetcher: Callable[[str], list[PickerItem]] | None = None
         self._all_items: list[PickerItem] = []
+        self._async_indexer = None
+        self._search_generation = 0
+        self._search_workers: list[FileSearchWorker] = []
 
         # 输入去抖：大仓库下 fetcher 是全表 O(n) 模糊打分，每个按键都跑会卡顿。
         # textChanged 只重置定时器，停顿 120ms 后才真正刷新候选列表。
@@ -160,7 +177,14 @@ class PickerDialog(QDialog):
 
     def set_fetcher(self, fetcher: Callable[[str], list[PickerItem]]) -> None:
         """fetcher(query) -> items；query 为空时返回默认列表"""
+        self._async_indexer = None
         self._fetcher = fetcher
+        self._refresh("")
+
+    def set_file_indexer(self, indexer) -> None:
+        """文件名搜索使用后台 worker，空查询只展示已有索引切片。"""
+        self._fetcher = None
+        self._async_indexer = indexer
         self._refresh("")
 
     def set_static_items(self, items: list[PickerItem]) -> None:
@@ -176,21 +200,85 @@ class PickerDialog(QDialog):
     def _on_query_changed(self, text: str) -> None:
         # 走去抖：仅记录最新 query 并重启定时器，停顿后由 _do_refresh 真正刷新
         self._pending_query = text
+        if self._async_indexer is not None:
+            self._cancel_search_workers()
         self._debounce.start()
 
     def _do_refresh(self) -> None:
         self._refresh(self._pending_query)
 
     def _refresh(self, query: str) -> None:
-        self.list.clear()
+        if self._async_indexer is not None:
+            if query.strip():
+                self._start_async_refresh(query)
+            else:
+                self._cancel_search_workers()
+                self._set_items([
+                    PickerItem(
+                        title=item.name_original,
+                        subtitle=item.rel_path,
+                        data=item.abs_path,
+                    )
+                    for item in self._async_indexer.files()[:150]
+                ])
+            return
         items = self._fetcher(query) if self._fetcher else []
-        for it in items[:200]:
-            # 文本由 _PickerItemDelegate 富文本渲染；这里只挂数据，不再拼纯文本
-            item = QListWidgetItem()
-            item.setData(Qt.ItemDataRole.UserRole, it)
-            self.list.addItem(item)
-        if self.list.count() > 0:
-            self.list.setCurrentRow(0)
+        self._set_items(items)
+
+    def _set_items(self, items: list[PickerItem]) -> None:
+        self.list.setUpdatesEnabled(False)
+        self.list.clear()
+        try:
+            for it in items[:200]:
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, it)
+                self.list.addItem(item)
+            if self.list.count() > 0:
+                self.list.setCurrentRow(0)
+        finally:
+            self.list.setUpdatesEnabled(True)
+
+    def _start_async_refresh(self, query: str) -> None:
+        self._cancel_search_workers()
+        self._search_generation += 1
+        generation = self._search_generation
+        worker = FileSearchWorker(
+            self._async_indexer.files(), query, 150, generation,
+            parent=QApplication.instance(),
+        )
+        self._search_workers.append(worker)
+        register_search_worker(worker, worker.requestInterruption)
+        worker.result.connect(self._on_async_result)
+        worker.finished.connect(self._on_search_worker_finished)
+        worker.finished.connect(worker.deleteLater)
+        self.list.clear()
+        waiting = QListWidgetItem("搜索中...")
+        waiting.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.list.addItem(waiting)
+        worker.start()
+
+    def _cancel_search_workers(self) -> None:
+        self._search_generation += 1
+        for worker in self._search_workers:
+            if worker.isRunning():
+                worker.requestInterruption()
+
+    def _on_async_result(self, generation: int, hits: list, _duration_ms: float) -> None:
+        if generation != self._search_generation:
+            return
+        self._set_items([
+            PickerItem(
+                title=item.name_original,
+                subtitle=item.rel_path,
+                data=item.abs_path,
+            )
+            for item in hits
+        ])
+
+    def _on_search_worker_finished(self) -> None:
+        worker = self.sender()
+        if worker in self._search_workers:
+            self._search_workers.remove(worker)
 
     def _on_activated(self, item: QListWidgetItem) -> None:
         picker = item.data(Qt.ItemDataRole.UserRole)
@@ -217,6 +305,11 @@ class PickerDialog(QDialog):
             self.reject()
             return
         super().changeEvent(e)
+
+    def closeEvent(self, e):
+        self._debounce.stop()
+        self._cancel_search_workers()
+        super().closeEvent(e)
 
     def eventFilter(self, obj, e):
         # 方向键 / Enter / ESC 在 input 或 list 上都能用
@@ -249,14 +342,7 @@ def show_file_picker(indexer, on_pick: Callable[[str], None], parent=None) -> Pi
     dlg = PickerDialog("按文件名搜索   (Ctrl+Shift+N)", parent)
     dlg.input.setPlaceholderText(f"已索引 {indexer.count()} 个文件...")
 
-    def fetch(query: str) -> list[PickerItem]:
-        hits = indexer.search(query, limit=150)
-        return [
-            PickerItem(title=f.name_original, subtitle=f.rel_path, data=f.abs_path)
-            for f in hits
-        ]
-
-    dlg.set_fetcher(fetch)
+    dlg.set_file_indexer(indexer)
     dlg.picked.connect(on_pick)
     return dlg
 

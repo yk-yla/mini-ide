@@ -42,6 +42,12 @@ def is_git_repo(path: str) -> bool:
     return rc == 0 and bool(out.strip())
 
 
+def has_git_metadata(path: str) -> bool:
+    """主线程可用的轻量仓库判断，只检查当前目录及祖先的 .git。"""
+    current = Path(path)
+    return any((candidate / ".git").exists() for candidate in (current, *current.parents))
+
+
 def repo_root(path: str) -> str:
     rc, out, _ = _run(["rev-parse", "--show-toplevel"], path, timeout=3)
     if rc != 0:

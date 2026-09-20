@@ -5,11 +5,57 @@ checkout / merge+push 走独立 worker 避免冻 UI。
 """
 from __future__ import annotations
 
+import logging
+import time
+
 from PySide6.QtCore import QThread, Signal
+
+
+perf_log = logging.getLogger("mini-ide.performance")
 
 
 class GitFetchWorker(QThread):
     """git fetch 后台执行（不改本地）。done(ok)"""
+
+    done = Signal(bool)
+
+    def __init__(self, cwd: str, parent=None, require_upstream: bool = False):
+        super().__init__(parent)
+        self.cwd = cwd
+        self.require_upstream = require_upstream
+
+    def run(self) -> None:
+        from src.core.git_ops import git_fetch, has_upstream
+        if self.require_upstream and not has_upstream(self.cwd):
+            self.done.emit(False)
+            return
+        ok = git_fetch(self.cwd)
+        self.done.emit(ok)
+
+
+class GitBranchListWorker(QThread):
+    """后台读取分支列表，避免打开分支菜单时同步启动多个 Git 子进程。"""
+
+    done = Signal(dict)
+
+    def __init__(self, cwd: str, parent=None):
+        super().__init__(parent)
+        self.cwd = cwd
+
+    def run(self) -> None:
+        started = time.perf_counter()
+        from src.core.git_ops import list_branches
+        data = list_branches(self.cwd)
+        perf_log.info(
+            "perf op=git-branch-worker duration_ms=%.1f files=%d status=done",
+            (time.perf_counter() - started) * 1000,
+            len(data.get("local", [])) + len(data.get("remote", [])),
+        )
+        self.done.emit(data)
+
+
+class GitDirtyCheckWorker(QThread):
+    """后台检查工作区是否有未提交改动。"""
 
     done = Signal(bool)
 
@@ -18,9 +64,15 @@ class GitFetchWorker(QThread):
         self.cwd = cwd
 
     def run(self) -> None:
-        from src.core.git_ops import git_fetch
-        ok = git_fetch(self.cwd)
-        self.done.emit(ok)
+        started = time.perf_counter()
+        from src.core.git_ops import is_dirty
+        dirty = is_dirty(self.cwd)
+        perf_log.info(
+            "perf op=git-dirty-worker duration_ms=%.1f files=0 matches=%d status=done",
+            (time.perf_counter() - started) * 1000,
+            int(dirty),
+        )
+        self.done.emit(dirty)
 
 
 class GitCheckoutWorker(QThread):
@@ -106,6 +158,7 @@ class GitStatusWorker(QThread):
         self.cwd = cwd
 
     def run(self) -> None:
+        started = time.perf_counter()
         from src.core.git_ops import (
             file_status_map, list_changed_files, list_deleted_paths,
             list_ignored_files,
@@ -121,4 +174,8 @@ class GitStatusWorker(QThread):
         # 状态栏改动数必须复用本轮新查到的 git status 结果，避免短缓存让
         # 外层显示"有改动"而 GitViewer 重新查询后显示干净。
         info = git_info.get_info(self.cwd, changed_count=len(changed))
+        perf_log.info(
+            "perf op=git-status-worker duration_ms=%.1f files=%d status=done",
+            (time.perf_counter() - started) * 1000, len(changed),
+        )
         self.done.emit(statuses, ignored, deleted, info)

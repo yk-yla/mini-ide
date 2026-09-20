@@ -10,13 +10,20 @@ SQL/HTML/CSS/XML/Groovy/Gradle/Properties...）。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import bisect
+import logging
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QCoreApplication, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QTextDocument,
 )
+
+from src.core.search_worker_lifecycle import register_background_worker
+
+
+perf_log = logging.getLogger("mini-ide.performance")
 
 try:
     from pygments import lex
@@ -29,7 +36,7 @@ except ImportError:
     _PYGMENTS_OK = False
 
 
-MAX_HIGHLIGHT_BYTES = 500_000   # 超过 500KB 不高亮，性能优先
+MAX_HIGHLIGHT_BYTES = 100_000   # Pygments 持有 GIL，超过 100KB 不高亮
 
 
 # ---- GitHub 代码高亮色板 ----
@@ -227,6 +234,76 @@ def _safe_lexer(name: str):
         return None
 
 
+# ---- 后台分词 ----
+
+
+def _build_block_token_index(text: str, lexer, should_stop) -> tuple[dict[int, list[tuple[int, int, str]]], int] | None:
+    """在无 Qt 对象的线程中建立 block -> token 区间索引。"""
+    block_starts: list[int] = [0]
+    for pos, ch in enumerate(text):
+        if ch == "\n":
+            block_starts.append(pos + 1)
+
+    formats: dict[int, list[tuple[int, int, str]]] = {}
+    token_count = 0
+    try:
+        tokens = lexer.get_tokens_unprocessed(text)
+        for start, token_type, token_text in tokens:
+            token_count += 1
+            if token_count % 128 == 0 and should_stop():
+                return None
+            if not token_text:
+                continue
+            token_key = str(token_type)
+            segment_start = 0
+            while segment_start < len(token_text):
+                newline = token_text.find("\n", segment_start)
+                segment_end = len(token_text) if newline < 0 else newline
+                segment_len = segment_end - segment_start
+                if segment_len:
+                    absolute = start + segment_start
+                    block_index = max(0, bisect.bisect_right(block_starts, absolute) - 1)
+                    offset = absolute - block_starts[block_index]
+                    formats.setdefault(block_index, []).append(
+                        (offset, segment_len, token_key)
+                    )
+                if newline < 0:
+                    break
+                segment_start = newline + 1
+    except Exception:
+        return None
+    return formats, token_count
+
+
+class _TokenizeWorker(QThread):
+    done = Signal(int, object, int, float)  # generation, index, token count, duration
+
+    def __init__(self, generation: int, text: str, lexer, parent=None):
+        super().__init__(parent)
+        self.generation = generation
+        self.text = text
+        self.lexer = lexer
+
+    def run(self) -> None:
+        started = time.perf_counter()
+        result = _build_block_token_index(
+            self.text, self.lexer, self.isInterruptionRequested,
+        )
+        duration_ms = (time.perf_counter() - started) * 1000
+        if result is None or self.isInterruptionRequested():
+            perf_log.info(
+                "perf op=syntax-tokenize duration_ms=%.1f files=0 status=stopped",
+                duration_ms,
+            )
+            return
+        index, token_count = result
+        perf_log.info(
+            "perf op=syntax-tokenize duration_ms=%.1f files=%d status=done",
+            duration_ms, token_count,
+        )
+        self.done.emit(self.generation, index, token_count, duration_ms)
+
+
 # ---- 高亮器 ----
 
 class PygmentsHighlighter(QSyntaxHighlighter):
@@ -245,12 +322,22 @@ class PygmentsHighlighter(QSyntaxHighlighter):
         self._retokenize_timer.setInterval(200)
         self._retokenize_timer.timeout.connect(self.retokenize)
         document.contentsChange.connect(self._on_contents_change)
+        self._generation = 0
+        self._worker: _TokenizeWorker | None = None
+        self._pending_request: tuple[int, str, object] | None = None
+        self._applied_generation = 0
+        self._last_tokenize_ms = 0.0
+        self._last_apply_ms = 0.0
         if lexer:
             self.retokenize()
 
     def _on_contents_change(self, position: int, chars_removed: int, chars_added: int) -> None:
         if chars_removed == 0 and chars_added == 0:
             return   # contentsChange 偶发零变更触发，跳过
+        self._generation += 1
+        if self._worker and self._worker.isRunning():
+            self._worker.requestInterruption()
+        self._pending_request = None
         self._retokenize_timer.start()
 
     def set_lexer(self, lexer) -> None:
@@ -261,63 +348,87 @@ class PygmentsHighlighter(QSyntaxHighlighter):
         _FORMAT_CACHE.clear()
         self.retokenize()
 
+    def stop(self) -> None:
+        """关闭预览时淘汰结果；线程由应用级生命周期统一等待。"""
+        self._generation += 1
+        self._pending_request = None
+        if self._retokenize_timer.isActive():
+            self._retokenize_timer.stop()
+        if self._worker and self._worker.isRunning():
+            self._worker.requestInterruption()
+
     def retokenize(self) -> None:
-        """根据当前文档全文重新 tokenize，建立 block→formats 索引"""
-        self._block_formats.clear()
+        """异步根据当前文档全文建立 block→formats 索引。"""
+        self._generation += 1
+        generation = self._generation
         if not self._lexer or not _PYGMENTS_OK:
+            self._pending_request = None
+            if self._worker and self._worker.isRunning():
+                self._worker.requestInterruption()
+            self._block_formats.clear()
             self.rehighlight()
             return
         text = self.document().toPlainText()
         if len(text.encode("utf-8", errors="ignore")) > MAX_HIGHLIGHT_BYTES:
+            self._pending_request = None
+            if self._worker and self._worker.isRunning():
+                self._worker.requestInterruption()
+            self._block_formats.clear()
             self.rehighlight()
             return
 
-        # 累加 block 起点位置
-        block_starts: list[int] = [0]
-        pos = 0
-        for ch in text:
-            if ch == "\n":
-                block_starts.append(pos + 1)
-            pos += 1
-
-        def find_block(offset: int) -> int:
-            # 二分（但 Python 没 builtin 2-sided，用 bisect）
-            import bisect
-            idx = bisect.bisect_right(block_starts, offset) - 1
-            return max(0, idx)
-
-        try:
-            tokens = self._lexer.get_tokens_unprocessed(text)
-        except Exception:
-            self.rehighlight()
+        request = (generation, text, self._lexer)
+        if self._worker and self._worker.isRunning():
+            self._pending_request = request
+            self._worker.requestInterruption()
             return
+        self._start_worker(*request)
 
-        for start, ttype, token_text in tokens:
-            if not token_text:
-                continue
-            fmt = _get_format(ttype)
-            # 如果 token 跨行，按行切分
-            remaining = token_text
-            cur = start
-            while remaining:
-                nl = remaining.find("\n")
-                if nl < 0:
-                    seg_len = len(remaining)
-                    b_idx = find_block(cur)
-                    off = cur - block_starts[b_idx]
-                    self._block_formats.setdefault(b_idx, []).append((off, seg_len, fmt))
-                    cur += seg_len
-                    remaining = ""
-                else:
-                    seg_len = nl
-                    if seg_len > 0:
-                        b_idx = find_block(cur)
-                        off = cur - block_starts[b_idx]
-                        self._block_formats.setdefault(b_idx, []).append((off, seg_len, fmt))
-                    cur += seg_len + 1
-                    remaining = remaining[seg_len + 1:]
+    def _start_worker(self, generation: int, text: str, lexer) -> None:
+        worker = _TokenizeWorker(
+            generation, text, lexer, parent=QCoreApplication.instance(),
+        )
+        self._worker = worker
+        worker.done.connect(self._apply_token_index)
+        worker.finished.connect(lambda w=worker: self._on_worker_finished(w))
+        worker.finished.connect(worker.deleteLater)
+        register_background_worker(worker, worker.requestInterruption)
+        worker.start()
 
+    def _on_worker_finished(self, worker: _TokenizeWorker) -> None:
+        if self._worker is worker:
+            self._worker = None
+        pending = self._pending_request
+        self._pending_request = None
+        if pending and pending[0] == self._generation and self._lexer:
+            self._start_worker(*pending)
+
+    def _apply_token_index(
+        self, generation: int, raw_index: object, token_count: int, tokenize_ms: float,
+    ) -> None:
+        if generation != self._generation or not isinstance(raw_index, dict):
+            return
+        started = time.perf_counter()
+        formats: dict[str, QTextCharFormat] = {}
+        block_formats: dict[int, list[tuple[int, int, QTextCharFormat]]] = {}
+        for block, entries in raw_index.items():
+            converted = []
+            for offset, length, token_key in entries:
+                fmt = formats.get(token_key)
+                if fmt is None:
+                    fmt = formats[token_key] = _get_format(token_key)
+                converted.append((offset, length, fmt))
+            block_formats[block] = converted
+        self._block_formats = block_formats
         self.rehighlight()
+        duration_ms = (time.perf_counter() - started) * 1000
+        self._applied_generation = generation
+        self._last_tokenize_ms = tokenize_ms
+        self._last_apply_ms = duration_ms
+        perf_log.info(
+            "perf op=syntax-highlight-apply duration_ms=%.1f files=%d status=done",
+            duration_ms, token_count,
+        )
 
     def highlightBlock(self, text: str) -> None:
         entries = self._block_formats.get(self.currentBlock().blockNumber())

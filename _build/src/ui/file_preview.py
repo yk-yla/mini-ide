@@ -458,6 +458,10 @@ class FilePreviewPane(QWidget):
             self._autosave()
         return not self._dirty
 
+    def stop_workers(self) -> None:
+        if self._highlighter is not None:
+            self._highlighter.stop()
+
     # ---- 加载 ----
 
     def _display_path(self) -> str:

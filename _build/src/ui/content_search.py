@@ -5,8 +5,12 @@
 """
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,7 +26,8 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.aggregate_workspace import is_scan_path_excluded, scan_exclusion_roots
-from src.core.file_index import IGNORED_EXTS, prune_scan_dirnames
+from src.core.file_index import FileIndexer, IGNORED_EXTS, prune_scan_dirnames
+from src.core.search_worker_lifecycle import register_search_worker
 from src.ui.theme import (
     FG_BRIGHT, FG_DIM, FG_PRIMARY, FG_SECONDARY, HIGHLIGHT_MATCH_BG,
     HIGHLIGHT_MATCH_FG, apply_search_style,
@@ -32,6 +37,10 @@ from src.ui.theme import (
 MAX_MATCHES = 1000
 MAX_FILE_SIZE = 2 * 1024 * 1024    # 单文件超 2MB 不扫
 MAX_LINE_LEN = 500                  # 匹配行显示截断
+RENDER_BATCH_SIZE = 80
+RENDER_INTERVAL_MS = 16
+SEARCH_IO_WORKERS = 4
+perf_log = logging.getLogger("mini-ide.performance")
 
 # 默认隐藏的"噪音文件"：日志、压缩/生成产物、lock 等。
 # 它们能被全文搜命中但绝大多数时候不是用户想找的源码，默认排除、
@@ -109,6 +118,13 @@ class SearchWorker(QThread):
         # 这样切换"含日志"开关无需重新 walk。
         self.file_list = file_list
         self._stop = False
+        self._literal_needle: bytes | None = None
+        if not use_regex:
+            # 大小写敏感文本可直接按 UTF-8 预筛；中文、数字等没有大小写
+            # 的查询在 IGNORECASE 下也可安全预筛。其余情况保留完整解码语义。
+            has_cased_char = any(ch.lower() != ch.upper() for ch in query)
+            if case_sensitive or not has_cased_char:
+                self._literal_needle = query.encode("utf-8")
 
     def stop(self) -> None:
         self._stop = True
@@ -151,11 +167,49 @@ class SearchWorker(QThread):
             pass
         return added, False
 
+    def _grep_file_buffered(self, path: str, pattern) -> list[ContentMatch]:
+        """Read one file once; reject non-matches before splitting it into lines."""
+        if self._stop:
+            return []
+        abs_p = Path(path)
+        try:
+            data = abs_p.read_bytes()
+        except OSError:
+            return []
+        if self._stop:
+            return []
+        if self._literal_needle is not None and self._literal_needle not in data:
+            return []
+        text = data.decode("utf-8", errors="replace")
+        # 普通文本/整词可先整文件排除。正则必须保持原有逐行语义，
+        # 例如 ^foo 应能匹配任意一行的开头，不能用整文件 search 预判。
+        if not self.regex and pattern.search(text) is None:
+            return []
+        try:
+            rel = str(abs_p.relative_to(self.root)).replace("\\", "/")
+        except ValueError:
+            return []
+        matches: list[ContentMatch] = []
+        for line_no, line in enumerate(text.splitlines(), 1):
+            if self._stop:
+                return []
+            match = pattern.search(line)
+            if match is None:
+                continue
+            shown = line if len(line) <= MAX_LINE_LEN else line[:MAX_LINE_LEN] + "…"
+            matches.append(ContentMatch(
+                abs_path=str(abs_p), rel_path=rel,
+                line_no=line_no, line_text=shown,
+                col_start=match.start(), col_end=match.end(),
+            ))
+        return matches
+
     def _run_cached(self, pattern) -> None:
         """走缓存清单：无 os.walk / stat，逐个文件 grep。"""
         scanned = 0
         total = 0
         batch: list[ContentMatch] = []
+        candidates: list[str] = []
         for path in self.file_list:
             if self._stop:
                 self.stopped.emit()
@@ -169,17 +223,39 @@ class SearchWorker(QThread):
             if self.include_exts and ext not in self.include_exts:
                 continue
             abs_p = Path(path)
-            scanned += 1
-            added, capped = self._grep_file(abs_p, pattern, batch, scanned, total)
-            total += added
-            if capped:
-                self.match_found.emit(batch)
-                self.done.emit(scanned, total)
-                return
-            if len(batch) >= 30:
-                self.match_found.emit(batch)
-                batch = []
-                self.progress.emit(scanned, total)
+            try:
+                if abs_p.stat().st_size > MAX_FILE_SIZE:
+                    continue
+            except OSError:
+                continue
+            candidates.append(path)
+
+        with ThreadPoolExecutor(
+            max_workers=SEARCH_IO_WORKERS, thread_name_prefix="content-search",
+        ) as executor:
+            for matches in executor.map(
+                lambda path: self._grep_file_buffered(path, pattern), candidates,
+                chunksize=8,
+            ):
+                if self._stop:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    self.stopped.emit()
+                    return
+                scanned += 1
+                remaining = MAX_MATCHES - total
+                if matches:
+                    batch.extend(matches[:remaining])
+                    total += min(len(matches), remaining)
+                if total >= MAX_MATCHES:
+                    if batch:
+                        self.match_found.emit(batch)
+                    self.done.emit(scanned, total)
+                    return
+                if len(batch) >= 30:
+                    self.match_found.emit(batch)
+                    batch = []
+                if scanned % 100 == 0:
+                    self.progress.emit(scanned, total)
         if batch:
             self.match_found.emit(batch)
         self.done.emit(scanned, total)
@@ -320,10 +396,12 @@ class ContentSearchDialog(QDialog):
 
     open_requested = Signal(str, int, int)   # abs_path, line, col
 
-    def __init__(self, project_root: str, parent=None):
+    def __init__(self, project_root: str, parent=None,
+                 indexer: FileIndexer | None = None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.root = project_root
+        self.indexer = indexer
         self.setWindowTitle(f"在项目中搜索   (Ctrl+Shift+F)   —   {project_root}")
         self.resize(1100, 700)
 
@@ -332,6 +410,15 @@ class ContentSearchDialog(QDialog):
         # 整项目候选文件清单缓存：首次搜索 walk 时填充，之后同会话内复用，
         # 避免每次输入都重新遍历目录树 + stat（大仓库下这是卡顿主因）
         self._file_cache: list[str] | None = None
+        self._render_queue: deque[ContentMatch] = deque()
+        self._pending_terminal: tuple[str, int, int] | None = None
+        self._discard_results = False
+        self._search_started = 0.0
+        self._first_batch_logged = False
+
+        self._render_timer = QTimer(self)
+        self._render_timer.setInterval(RENDER_INTERVAL_MS)
+        self._render_timer.timeout.connect(self._flush_matches)
 
         # 输入即搜去抖：停顿 250ms 才真正触发，避免每个按键都起一个 worker
         self._debounce = QTimer(self)
@@ -450,6 +537,11 @@ class ContentSearchDialog(QDialog):
             return
         self._debounce.start()
 
+    def _candidate_files(self) -> list[str] | None:
+        if self.indexer is not None and self.indexer.has_complete_snapshot():
+            return [item.abs_path for item in self.indexer.files()]
+        return self._file_cache
+
     def _start_search(self) -> None:
         self._debounce.stop()
         query = self.input.text().strip()
@@ -462,7 +554,15 @@ class ContentSearchDialog(QDialog):
         exts = [e.strip() if e.strip().startswith(".") else ("." + e.strip())
                 for e in self.ext_filter.text().split(",") if e.strip()]
 
+        self._render_timer.stop()
+        self._render_queue.clear()
+        self._pending_terminal = None
+        self._discard_results = False
+        self._search_started = time.perf_counter()
+        self._first_batch_logged = False
+        self.tree.setUpdatesEnabled(False)
         self.tree.clear()
+        self.tree.setUpdatesEnabled(True)
         self._file_items: dict[str, QTreeWidgetItem] = {}
         self._file_counts: dict[str, int] = {}
         self._file_dirs: dict[str, str] = {}
@@ -479,12 +579,17 @@ class ContentSearchDialog(QDialog):
             hi_pattern = None
         self._delegate.set_pattern(hi_pattern)
 
+        file_list = self._candidate_files()
+        perf_log.info(
+            "perf op=content-search-start files=%d query_len=%d status=start",
+            len(file_list) if file_list is not None else -1, len(query),
+        )
         self._worker = SearchWorker(
             root=self.root, query=query,
             case_sensitive=self.chk_case.isChecked(),
             whole_word=self.chk_word.isChecked(),
             use_regex=self.chk_regex.isChecked(),
-            include_exts=exts, file_list=self._file_cache,
+            include_exts=exts, file_list=file_list,
             include_noise=self.chk_noise.isChecked(),
             parent=QApplication.instance(),
         )
@@ -493,6 +598,7 @@ class ContentSearchDialog(QDialog):
         self._worker.done.connect(self._on_done)
         self._worker.stopped.connect(self._on_stopped)
         self._worker.files_collected.connect(self._on_files_collected)
+        register_search_worker(self._worker, self._worker.stop)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
@@ -505,6 +611,10 @@ class ContentSearchDialog(QDialog):
     def _stop_search(self, restart: bool = False) -> None:
         if self._worker and self._worker.isRunning():
             self._pending_restart = restart
+            self._discard_results = True
+            self._render_timer.stop()
+            self._render_queue.clear()
+            self._pending_terminal = None
             self._worker.stop()
             self.status.setText("正在停止...")
             self.btn_search.setEnabled(False)
@@ -513,43 +623,77 @@ class ContentSearchDialog(QDialog):
             self._pending_restart = False
 
     def _on_matches(self, batch: list[ContentMatch]) -> None:
-        if self.sender() is not self._worker:
+        if self.sender() is not self._worker or self._discard_results:
             return
-        for m in batch:
-            parent = self._file_items.get(m.rel_path)
-            if parent is None:
-                # 关键改动：第一列只放文件名（短、加粗、放大），目录路径降级到第二列。
-                # 这样列宽自适应，不会再出现 "commons/.../co..." 这种看不出文件名的截断
-                p = Path(m.rel_path)
-                file_name = p.name
-                parent_dir = str(p.parent).replace("\\", "/")
-                if parent_dir == ".":
-                    parent_dir = ""
-                parent = QTreeWidgetItem([f"📄  {file_name}", parent_dir])
-                bold = QFont(parent.font(0))
-                bold.setBold(True)
-                bold.setPointSize(bold.pointSize() + 1)   # 比子节点大一号，分组感强
-                parent.setFont(0, bold)
-                parent.setForeground(0, QColor(str(FG_PRIMARY)))
-                parent.setForeground(1, QColor(str(FG_SECONDARY)))
-                parent.setToolTip(0, m.abs_path)
-                parent.setToolTip(1, m.rel_path)
-                self.tree.addTopLevelItem(parent)
-                parent.setExpanded(True)
-                self._file_items[m.rel_path] = parent
-                self._file_counts[m.rel_path] = 0
-                self._file_dirs[m.rel_path] = parent_dir
-            # 子节点：行号在第一列（"L 538"），命中行内容在第二列；行号弱色，内容主色
-            child = QTreeWidgetItem([f"   L {m.line_no}", m.line_text])
-            child.setData(0, Qt.ItemDataRole.UserRole, (m.abs_path, m.line_no, m.col_start))
-            child.setForeground(0, QColor(str(FG_DIM)))
-            child.setForeground(1, QColor(str(FG_PRIMARY)))
-            parent.addChild(child)
-            self._file_counts[m.rel_path] += 1
-            # 第二列同时显示「目录 · N 处命中」（命中数动态更新）
-            d = self._file_dirs[m.rel_path]
-            n = self._file_counts[m.rel_path]
-            parent.setText(1, f"{d}    ·    {n} 处命中" if d else f"{n} 处命中")
+        if batch and not self._first_batch_logged:
+            self._first_batch_logged = True
+            perf_log.info(
+                "perf op=content-search-first-batch duration_ms=%.1f matches=%d status=done",
+                (time.perf_counter() - self._search_started) * 1000, len(batch),
+            )
+        self._render_queue.extend(batch)
+        if not self._render_timer.isActive():
+            self._render_timer.start()
+
+    def _flush_matches(self) -> None:
+        batch: list[ContentMatch] = []
+        while self._render_queue and len(batch) < RENDER_BATCH_SIZE:
+            batch.append(self._render_queue.popleft())
+        if batch:
+            self._render_match_batch(batch)
+        if self._render_queue:
+            return
+        self._render_timer.stop()
+        if self._pending_terminal is not None:
+            self._finish_terminal()
+
+    def _render_match_batch(self, batch: list[ContentMatch]) -> None:
+        touched: set[str] = set()
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for match in batch:
+                parent = self._file_items.get(match.rel_path)
+                if parent is None:
+                    path = Path(match.rel_path)
+                    parent_dir = str(path.parent).replace("\\", "/")
+                    if parent_dir == ".":
+                        parent_dir = ""
+                    parent = QTreeWidgetItem([f"📄  {path.name}", parent_dir])
+                    bold = QFont(parent.font(0))
+                    bold.setBold(True)
+                    bold.setPointSize(bold.pointSize() + 1)
+                    parent.setFont(0, bold)
+                    parent.setForeground(0, QColor(str(FG_PRIMARY)))
+                    parent.setForeground(1, QColor(str(FG_SECONDARY)))
+                    parent.setToolTip(0, match.abs_path)
+                    parent.setToolTip(1, match.rel_path)
+                    self.tree.addTopLevelItem(parent)
+                    parent.setExpanded(True)
+                    self._file_items[match.rel_path] = parent
+                    self._file_counts[match.rel_path] = 0
+                    self._file_dirs[match.rel_path] = parent_dir
+                child = QTreeWidgetItem([f"   L {match.line_no}", match.line_text])
+                child.setData(
+                    0, Qt.ItemDataRole.UserRole,
+                    (match.abs_path, match.line_no, match.col_start),
+                )
+                child.setForeground(0, QColor(str(FG_DIM)))
+                child.setForeground(1, QColor(str(FG_PRIMARY)))
+                parent.addChild(child)
+                self._file_counts[match.rel_path] += 1
+                touched.add(match.rel_path)
+            for rel_path in touched:
+                parent = self._file_items[rel_path]
+                directory = self._file_dirs[rel_path]
+                count = self._file_counts[rel_path]
+                parent.setText(
+                    1,
+                    f"{directory}    ·    {count} 处命中"
+                    if directory else f"{count} 处命中",
+                )
+        finally:
+            self.tree.setUpdatesEnabled(True)
+            self.tree.viewport().update()
 
     def _on_progress(self, scanned: int, total: int) -> None:
         if self.sender() is not self._worker:
@@ -559,22 +703,46 @@ class ContentSearchDialog(QDialog):
     def _on_done(self, scanned: int, total: int) -> None:
         if self.sender() is not self._worker:
             return
-        self.status.setText(f"完成：扫描 {scanned} 文件 | 命中 {total}" +
-                            (f"  (达到上限 {MAX_MATCHES})" if total >= MAX_MATCHES else ""))
-        self.btn_search.setEnabled(True)
-        self.btn_stop.setEnabled(False)
         self._worker = None
-        if self._pending_restart:
-            self._pending_restart = False
-            QTimer.singleShot(0, self._start_search)
+        state = "done" if self.input.text().strip() else "cleared"
+        self._pending_terminal = (state, scanned, total)
+        if self._render_queue:
+            if not self._render_timer.isActive():
+                self._render_timer.start()
+        else:
+            self._finish_terminal()
 
     def _on_stopped(self) -> None:
         if self.sender() is not self._worker:
             return
-        self.status.setText("已停止")
+        self._render_timer.stop()
+        self._render_queue.clear()
+        self._worker = None
+        state = "stopped" if self.input.text().strip() else "cleared"
+        self._pending_terminal = (state, 0, 0)
+        self._finish_terminal()
+
+    def _finish_terminal(self) -> None:
+        if self._pending_terminal is None:
+            return
+        state, scanned, total = self._pending_terminal
+        self._pending_terminal = None
+        duration_ms = (time.perf_counter() - self._search_started) * 1000
+        if state == "done":
+            self.status.setText(
+                f"完成：扫描 {scanned} 文件 | 命中 {total}" +
+                (f"  (达到上限 {MAX_MATCHES})" if total >= MAX_MATCHES else "")
+            )
+        elif state == "stopped":
+            self.status.setText("已停止")
+        else:
+            self.status.setText("就绪")
+        perf_log.info(
+            "perf op=content-search duration_ms=%.1f files=%d matches=%d status=%s",
+            duration_ms, scanned, total, state,
+        )
         self.btn_search.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self._worker = None
         if self._pending_restart:
             self._pending_restart = False
             QTimer.singleShot(0, self._start_search)
