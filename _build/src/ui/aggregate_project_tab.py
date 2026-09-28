@@ -325,6 +325,9 @@ class _WorkspaceCard(QFrame):
 class AggregateProjectTab(QWidget):
     """聚合目录、直属项目和该目录需求工作区的唯一顶层工作台。"""
 
+    # 进入/退出工作区或改名后发出，主窗口据此刷新顶层 Tab 标题。
+    environment_changed = Signal()
+
     def __init__(
         self,
         project: AggregateProject,
@@ -730,12 +733,24 @@ class AggregateProjectTab(QWidget):
     def refresh_theme(self) -> None:
         self.refresh_project_states()
 
+    def tab_title(self) -> str:
+        """顶层 Tab 标题；工作区模式带上需求名，避免误以为在源目录。"""
+        if self.workspace is None:
+            return self.aggregate_project.name
+        return f"{self.aggregate_project.name} · {self.workspace.name}"
+
+    def tab_tooltip(self) -> str:
+        if self.workspace is None:
+            return self.aggregate_project.root_path
+        return f"需求工作区：{self.workspace.name}\n{self.workspace.root_path}"
+
     def _set_context_label(self) -> None:
         if self.workspace is None:
             self.context_label.setText(f"源目录：{self.aggregate_project.root_path}")
         else:
             self.context_label.setText(f"当前需求：{self.workspace.name}")
         self.exit_workspace_button.setVisible(self.workspace is not None)
+        self.environment_changed.emit()
 
     def activate_workspace(
         self, workspace: DevelopmentWorkspace | None, *, interactive: bool = True,
@@ -1332,11 +1347,7 @@ class AggregateProjectTab(QWidget):
         self.stable_id = project.id
         self.project_meta.name = project.name
         self.title_label.setText(project.name)
-        parent = self.parentWidget()
-        if isinstance(parent, QTabWidget):
-            index = parent.indexOf(self)
-            if index >= 0:
-                parent.setTabText(index, project.name)
+        self.environment_changed.emit()
         entry = self.config.find_project(project.root_path) or ProjectEntry(
             path=project.root_path,
         )

@@ -1343,15 +1343,87 @@ def aggregate_runtime_ui_check() -> list[str]:
             root_path=str(workspace_root),
             name="certificate",
         )
+        # 顶层 Tab 标题必须随工作区切换刷新，不能只靠标题旁的小字提示。
+        from PySide6.QtWidgets import QMessageBox, QTabWidget, QWidget
+
+        from src.ui.main_window import MainWindow
+        active_workspace = tab.workspace
+        tab.workspace = None
+        top_tabs = QTabWidget()
+        top_tabs.addTab(tab, tab.tab_title())
+        tab.workspace = active_workspace
+        title_host = SimpleNamespace(tabs=top_tabs)
+
+        def refresh_title():
+            MainWindow._refresh_aggregate_tab_title(title_host, tab)
+
+        tab.environment_changed.connect(refresh_title)
+        if top_tabs.tabText(0) != "suite":
+            failed.append("source-mode aggregate tab title must stay the aggregate name")
         tab._set_context_label()
         if tab.exit_workspace_button.isHidden():
             failed.append("active workspace must expose its exit action in the header")
         if "当前需求：certificate" != tab.context_label.text():
             failed.append("aggregate header must identify the active workspace")
+        if top_tabs.tabText(0) != "suite · certificate":
+            failed.append(f"workspace-mode tab title must name the workspace: {top_tabs.tabText(0)!r}")
+        if "certificate" not in top_tabs.tabToolTip(0):
+            failed.append("workspace-mode tab tooltip must identify the workspace")
         if tab._current_environment_root() != workspace_root:
             failed.append("project tools must open the active workspace root")
+
+        # 启动恢复进工作区时要弹出非模态提示。
+        notified: list[list] = []
+        restore_host = SimpleNamespace(
+            config=SimpleNamespace(
+                active_tabs=[f"development:{root}"], active_tab_index=0,
+                aggregate_project_paths=[],
+            ),
+            tabs=top_tabs,
+            open_aggregate_project=lambda _key: tab,
+            open_development_workspace=lambda _key: tab,
+            open_project=lambda _key: tab,
+            _notify_restored_workspaces=lambda tabs: notified.append(list(tabs)),
+            _restoring_tabs=False,
+            _save_tab_session=lambda: None,
+        )
+
+        def run_restore() -> bool:
+            # 会话恢复按定时器逐个打开，需要等 on_done 回调后再检查。
+            done: list[bool] = []
+            MainWindow._restore_tabs(restore_host, lambda: done.append(True))
+            deadline = time.time() + 5
+            while not done and time.time() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+            return bool(done)
+
+        if not run_restore():
+            failed.append("session restore must finish and call on_done")
+        if notified != [[tab]]:
+            failed.append("startup restore into a workspace must trigger a notice")
+        notice_parent = QWidget()
+        MainWindow._notify_restored_workspaces(notice_parent, [tab])
+        boxes = notice_parent.findChildren(QMessageBox)
+        if len(boxes) != 1 or boxes[0].isModal() or "certificate" not in boxes[0].text():
+            failed.append("workspace restore notice must be a non-modal message naming the workspace")
+        for box in boxes:
+            box.close()
+        notice_parent.deleteLater()
+
         tab.workspace = None
         tab._set_context_label()
+        if top_tabs.tabText(0) != "suite":
+            failed.append("leaving a workspace must restore the aggregate tab title")
+        notified.clear()
+        if not run_restore():
+            failed.append("source-mode session restore must finish and call on_done")
+        if notified:
+            failed.append("source-mode restore must not show the workspace notice")
+        tab.environment_changed.disconnect(refresh_title)
+        top_tabs.removeTab(0)
+        tab.setParent(None)
+        top_tabs.deleteLater()
 
         class TopTabs:
             def count(self):

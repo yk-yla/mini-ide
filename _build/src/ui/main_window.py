@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import psutil
-from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QAction, QActionGroup, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon,
     QKeySequence, QShortcut,
@@ -571,8 +571,11 @@ class MainWindow(QMainWindow):
             existing_tabs=adopted,
             parent=self.tabs,
         )
-        index = self.tabs.addTab(tab, project.name)
-        self.tabs.setTabToolTip(index, project.root_path)
+        index = self.tabs.addTab(tab, tab.tab_title())
+        self.tabs.setTabToolTip(index, tab.tab_tooltip())
+        tab.environment_changed.connect(
+            lambda tab=tab: self._refresh_aggregate_tab_title(tab)
+        )
         self.tabs.setCurrentIndex(index)
         self._rebuild_workspace_menu()
         self._switch_view()
@@ -641,6 +644,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "切换失败", f"{tab.project_meta.name} 未能完全停止。")
                 return False
         return True
+
+    def _refresh_aggregate_tab_title(self, tab: AggregateProjectTab) -> None:
+        index = self.tabs.indexOf(tab)
+        if index >= 0:
+            self.tabs.setTabText(index, tab.tab_title())
+            self.tabs.setTabToolTip(index, tab.tab_tooltip())
 
     def find_tab_by_path(self, path: str):
         key = normalized_path_key(path)
@@ -913,6 +922,7 @@ class MainWindow(QMainWindow):
         self._restoring_tabs = True
         next_index = 0
         opened = 0
+        restored_workspaces: list[AggregateProjectTab] = []
 
         def finish() -> None:
             if opened and target_index < self.tabs.count():
@@ -923,6 +933,8 @@ class MainWindow(QMainWindow):
                 "perf op=session-restore duration_ms=%.1f files=%d status=done",
                 (time.perf_counter() - started) * 1000, opened,
             )
+            if restored_workspaces:
+                self._notify_restored_workspaces(restored_workspaces)
             if on_done:
                 on_done()
 
@@ -949,6 +961,8 @@ class MainWindow(QMainWindow):
                             tab = self.open_project(key)
                         if tab is not None:
                             opened += 1
+                            if isinstance(tab, AggregateProjectTab) and tab.workspace is not None:
+                                restored_workspaces.append(tab)
                     else:
                         status = "skipped"
                         log.warning("跳过不存在的项目: %s", key)
@@ -962,3 +976,22 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(10, restore_next)
 
         QTimer.singleShot(0, restore_next)
+
+    def _notify_restored_workspaces(self, tabs: list[AggregateProjectTab]) -> None:
+        """启动恢复进工作区时明确提示，避免把工作区代码当成源目录启动。"""
+        lines = [f"- {tab.aggregate_project.name}：{tab.workspace.name}" for tab in tabs]
+        log.info("启动恢复到需求工作区: %s", "、".join(tab.tab_title() for tab in tabs))
+        box = QMessageBox(
+            QMessageBox.Icon.Information,
+            "已恢复到需求工作区",
+            "以下项目按上次状态恢复在需求工作区中：\n"
+            + "\n".join(lines)
+            + "\n\n此时启动、编译使用的是工作区代码，不是源目录。"
+            "需要使用源目录时，请点击标题旁的“退出工作区”。",
+            QMessageBox.StandardButton.Ok,
+            self,
+        )
+        # 非模态，不阻塞 CLI 请求和后续操作。
+        box.setModal(False)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        box.show()
