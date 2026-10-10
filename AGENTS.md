@@ -23,6 +23,7 @@
 - 性能优化基线、阶段计划和验收标准见 [docs/performance.md](docs/performance.md)；涉及扫描、索引、搜索、主线程或大数据量渲染的改动先对照该文档。
 - 发布文件：根目录 `mini-ide.exe`、`mini-ide-cli.exe`、`mini-ide-runtime/`。
 - 打包脚本：`_build\scripts\build.bat`。
+- 每次成功打包自动递增补丁版本，失败不递增；规则与独立打包方式见 [docs/releasing.md](docs/releasing.md)。
 - 冒烟测试：在 `_build` 目录运行 `poetry run python scripts/_smoke.py`。
 
 ## 产品行为

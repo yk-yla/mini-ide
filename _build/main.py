@@ -41,7 +41,6 @@ from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from src.util import app_log
-from src.core.search_worker_lifecycle import stop_background_workers
 from src.ui.main_window import MainWindow
 from src.ui.theme import apply_theme
 from src.core.config import AppConfig
@@ -165,10 +164,9 @@ def main():
             Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
         )
         app = QApplication(sys.argv)
-        # CLI --quit calls QApplication.quit() directly, so cleanup must also
-        # run from aboutToQuit instead of relying only on MainWindow.closeEvent.
-        app.aboutToQuit.connect(stop_background_workers)
         app.setApplicationName("mini-ide")
+        from src.core.app_version import build_info
+        app.setApplicationVersion(build_info()["version"])
         app.setOrganizationName("whaty")
         # 主窗口关闭时会隐藏到系统托盘，不能因最后一个窗口隐藏而结束事件循环。
         app.setQuitOnLastWindowClosed(False)

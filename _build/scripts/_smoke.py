@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 modules = [
+    "src.core.app_version",
     "src.core.config",
     "src.core.project_detector",
     "src.core.runtime_units",
@@ -1447,9 +1448,10 @@ def aggregate_runtime_ui_check() -> list[str]:
             def __init__(self, component_id: str):
                 self.component_id = component_id
 
-            def start(self):
+            def request(self, action, module=None, on_done=None):
+                assert action == "start"
                 attempts.append(self.component_id)
-                return {"ok": True}
+                return {"ok": True, "pending": True}
 
         class FakeTab:
             _is_multi_module = False

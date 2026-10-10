@@ -1,7 +1,10 @@
 """主窗口：Tab 容器 + 菜单栏 + 状态栏 + 空状态切换"""
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread
+
 import time
+from collections import deque
 from pathlib import Path
 
 import psutil
@@ -11,7 +14,7 @@ from PySide6.QtGui import (
     QKeySequence, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox,
+    QApplication, QDialog, QFileDialog, QLabel, QMainWindow, QMessageBox,
     QMenu, QStackedWidget, QSystemTrayIcon, QTabWidget,
 )
 
@@ -31,7 +34,8 @@ from src.core.target_resolver import (
 from src.core.service_state import (
     STATE_RUNNING_EXTERNAL, STATE_RUNNING_MANAGED,
 )
-from src.core.search_worker_lifecycle import stop_search_workers
+from src.core.search_worker_lifecycle import BackgroundShutdownWaiter, active_background_workers
+from src.core.application_lifecycle import ApplicationQuitGuard
 from src.ui.empty_state import EmptyState
 from src.ui.aggregate_project_tab import AggregateProjectTab
 from src.ui.project_tab import ProjectTab
@@ -102,7 +106,7 @@ def _normalized_tab_session(
     return normalized, target_index
 
 
-class _CreateAggregateProjectWorker(QThread):
+class _CreateAggregateProjectWorker(BackgroundThread):
     done = Signal(object, str)
 
     def __init__(self, root_path: str, parent=None):
@@ -133,6 +137,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self._quit_requested = False
+        self._quit_prepared = False
+        self._shutdown_in_progress = False
+        self._shutdown_waiter = None
+        self._quit_guard = ApplicationQuitGuard(self)
         self.setWindowTitle("mini-ide")
         self.resize(1480, 900)
         self.setMinimumSize(960, 600)
@@ -276,22 +284,27 @@ class MainWindow(QMainWindow):
         if action is not None:
             action.setChecked(True)
         self.config.save()
-        self._theme_refresh_queue = list(app.allWidgets())
+        self._theme_refresh_queue = deque(app.allWidgets())
         QTimer.singleShot(0, self._refresh_theme_batch)
         log.info("切换主题: %s", self.config.theme)
 
     def _refresh_theme_batch(self) -> None:
         from src.ui.theme import apply_search_style
 
-        queue = getattr(self, "_theme_refresh_queue", [])
-        batch, self._theme_refresh_queue = queue[:80], queue[80:]
-        for widget in batch:
-            if widget.property("role") == "search":
-                apply_search_style(widget)
-            refresh = getattr(widget, "refresh_theme", None)
-            if callable(refresh):
-                refresh()
-        if self._theme_refresh_queue:
+        from shiboken6 import isValid
+        queue = getattr(self, "_theme_refresh_queue", deque())
+        started = time.perf_counter()
+        while queue:
+            widget = queue.popleft()
+            if isValid(widget):
+                if widget.property("role") == "search":
+                    apply_search_style(widget)
+                refresh = getattr(widget, "refresh_theme", None)
+                if callable(refresh):
+                    refresh()
+            if time.perf_counter() - started >= 0.008:
+                break
+        if queue:
             QTimer.singleShot(0, self._refresh_theme_batch)
 
     def _setup_tray(self) -> None:
@@ -335,8 +348,123 @@ class MainWindow(QMainWindow):
 
     def _request_quit(self) -> None:
         """托盘/菜单的显式退出，复用 closeEvent 中的服务停止检查。"""
+        if self._shutdown_in_progress:
+            return
         self._quit_requested = True
         self.close()
+
+    def _shutdown_project_tabs(self) -> list[ProjectTab]:
+        projects = []
+        for index in range(self.tabs.count()):
+            tab = self.tabs.widget(index)
+            if isinstance(tab, AggregateProjectTab):
+                projects.extend(tab.component_tabs.values())
+            elif isinstance(tab, ProjectTab):
+                projects.append(tab)
+        return projects
+
+    def prepare_application_quit(self, on_done, *, stop_running=True, quiet=True,
+                                 timeout_ms=10000) -> None:
+        if self._shutdown_in_progress:
+            on_done({"ok": False, "error": "quit already in progress"})
+            return
+        project_tabs = self._shutdown_project_tabs()
+        for tab in project_tabs:
+            if not tab.flush_pending_saves(quiet=quiet):
+                on_done({"ok": False, "error": "unsaved files; quit cancelled"})
+                self._quit_requested = False
+                return
+        running = self._collect_running_services()
+        self._shutdown_in_progress = True
+        QApplication.instance().setProperty("mini_ide_shutting_down", True)
+        self.setEnabled(False)
+        self._mem_timer.stop()
+        for dialog in self.findChildren(QDialog):
+            dialog.close()
+        polling = {tab: tab.suspend_background_tasks() for tab in project_tabs}
+        aggregate_timers = []
+        for index in range(self.tabs.count()):
+            tab = self.tabs.widget(index)
+            if isinstance(tab, AggregateProjectTab):
+                aggregate_timers.append((tab, tab._refresh_timer.isActive()))
+                tab._refresh_timer.stop()
+
+        def cancel(error: str) -> None:
+            self._quit_prepared = False
+            self._shutdown_in_progress = False
+            self._quit_requested = False
+            QApplication.instance().setProperty("mini_ide_shutting_down", False)
+            self.setEnabled(True)
+            self._mem_timer.start()
+            for tab in self._shutdown_project_tabs():
+                tab.resume_background_tasks(polling.get(tab, (True, tab._is_git_repo)))
+            for tab, was_active in aggregate_timers:
+                if was_active:
+                    tab._refresh_timer.start()
+            log.warning("安全退出已取消: %s", error)
+            on_done({"ok": False, "error": error})
+
+        self._shutdown_cancel = cancel
+
+        def prepared(stopped: bool) -> None:
+            self._shutdown_waiter = None
+            if not stopped:
+                cancel("background tasks still running; quit cancelled")
+                return
+            for index in range(self.tabs.count()):
+                tab = self.tabs.widget(index)
+                if isinstance(tab, (ProjectTab, AggregateProjectTab)):
+                    if not tab.request_close(confirm_running=False,
+                                             stop_running=stop_running, quiet=True):
+                        cancel("project could not close safely; quit cancelled")
+                        return
+            # Closing panes/indices can start observer cleanup tasks. Wait for
+            # those as well before persisting success and responding to CLI.
+            self._shutdown_waiter = BackgroundShutdownWaiter(finalize, timeout_ms, self)
+            self._shutdown_waiter.start()
+
+        def finalize(stopped: bool) -> None:
+            self._shutdown_waiter = None
+            if not stopped:
+                cancel("background cleanup still running; quit cancelled")
+                return
+            try:
+                self._persist_geometry()
+                self._persist_tabs()
+                self.config.save()
+            except Exception:
+                log.exception("退出前保存会话失败")
+                cancel("failed to save session; quit cancelled")
+                return
+            self._quit_prepared = True
+            log.info("安全退出检查通过: services=%d stop=%s", len(running), stop_running)
+            by_project = {}
+            for item in running:
+                by_project.setdefault(item["project"], []).append(item)
+            on_done({"ok": True, "stopped": len(running) if stop_running else 0,
+                     "services": running, "projects": [
+                         {"name": name, "stopped": len(items) if stop_running else 0,
+                          "services": items} for name, items in by_project.items()
+                     ]})
+
+        self._shutdown_waiter = BackgroundShutdownWaiter(prepared, timeout_ms, self)
+        self._shutdown_waiter.start()
+
+    def finish_application_quit(self) -> None:
+        if self._quit_prepared:
+            if active_background_workers():
+                def checked(stopped: bool) -> None:
+                    self._shutdown_waiter = None
+                    if stopped:
+                        self.finish_application_quit()
+                    else:
+                        self._shutdown_cancel("new background task still running; quit cancelled")
+                if self._shutdown_waiter is None:
+                    self._shutdown_waiter = BackgroundShutdownWaiter(checked, parent=self)
+                    self._shutdown_waiter.start()
+                return
+            self._quit_requested = True
+            self.close()
 
     def _rebuild_recent_menu(self) -> None:
         self.recent_menu.clear()
@@ -690,13 +818,17 @@ class MainWindow(QMainWindow):
 
     def _about(self) -> None:
         from src.ui.theme import FG_SECONDARY
+        from src.core.app_version import build_info
+        from html import escape
+        info = build_info()
+        stamp = f"<p>构建时间：{escape(info['build_time'])}</p>" if info["build_time"] else ""
         QMessageBox.about(
             self,
             "关于 mini-ide",
             "<h3>mini-ide</h3>"
             "<p>AI 时代的开发指挥台</p>"
             "<p>Spring Boot / Vue / Python 项目的轻量启动器</p>"
-            f"<p style='color:{FG_SECONDARY};'>v0.1.0</p>",
+            f"<p style='color:{FG_SECONDARY};'>v{escape(info['version'])}</p>" + stamp,
         )
 
     def _open_app_log(self) -> None:
@@ -760,43 +892,29 @@ class MainWindow(QMainWindow):
             log.info("关闭窗口：隐藏到系统托盘")
             return
 
+        if self._quit_prepared:
+            super().closeEvent(e)
+            QApplication.quit()
+            return
+        e.ignore()
+        if self._shutdown_in_progress:
+            return
         running = self._collect_running_services()
         stop_running = True
         if running:
             choice = self._confirm_close_with_services(running)
             if choice == "cancel":
                 self._quit_requested = False
-                e.ignore()
                 return
             stop_running = choice == "stop"
 
-        for i in range(self.tabs.count()):
-            w = self.tabs.widget(i)
-            if w and hasattr(w, "request_close"):
-                if not w.request_close(confirm_running=False, stop_running=stop_running):
-                    self._quit_requested = False
-                    e.ignore()
-                    return
-        if not stop_search_workers():
-            self._quit_requested = False
-            e.ignore()
-            log.error("搜索线程未能在退出前停止，已取消退出")
-            return
-        self._persist_geometry()
-        self._persist_tabs()
-        self.config.save()
-        if running:
-            kept = [
-                x for x in running
-                if not stop_running and x.get("state") == STATE_RUNNING_EXTERNAL
-            ]
-            log.info(
-                "退出前服务处理：running=%d stop=%s kept_external=%d",
-                len(running), stop_running, len(kept),
-            )
-        super().closeEvent(e)
-        # 显式退出时结束事件循环；普通关闭已在上面隐藏到托盘。
-        QApplication.quit()
+        def complete(result: dict) -> None:
+            if result.get("ok"):
+                QTimer.singleShot(0, self.finish_application_quit)
+            else:
+                QMessageBox.warning(self, "退出已取消", result.get("error", "无法安全退出。"))
+
+        self.prepare_application_quit(complete, stop_running=stop_running, quiet=False)
 
     def _collect_running_services(self) -> list[dict]:
         items: list[dict] = []

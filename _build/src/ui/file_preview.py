@@ -18,13 +18,17 @@
 """
 from __future__ import annotations
 
+import re
+from array import array
+from bisect import bisect_left
+
 import math
 import time
 from pathlib import Path
 
 from PySide6.QtCore import (
     Qt, QBuffer, QByteArray, QFileSystemWatcher, QIODevice, QRect, QSize, QTimer,
-    Signal,
+    Signal, QRegularExpression,
 )
 from PySide6.QtGui import (
     QAction, QColor, QFont, QImageReader, QKeySequence, QMovie, QPainter, QPixmap,
@@ -39,6 +43,7 @@ from src.core.file_preview_model import (
     BINARY_EXTS, detect_encoding, detect_newline, image_suffix_format, is_movie_path,
     line_comment_prefix, should_wrap_text,
 )
+from src.core.search_worker_lifecycle import BackgroundThread, background_tasks_suspended
 from src.ui.syntax_highlighter import PygmentsHighlighter, get_lexer_for
 from src.ui.theme import (
     BG_CODE, BG_L2, BG_L4, BORDER_SUBTLE, COLOR_ERROR, COLOR_SUCCESS, COLOR_WARN,
@@ -50,9 +55,35 @@ from src.util.editor import REVEAL_LABEL, open_in_editor, reveal_in_explorer
 log = app_log.get_logger("preview")
 
 _MAX_READ_BYTES = 2 * 1024 * 1024   # 2MB 以上只读头部
+_MAX_LINE_CHARS = 20_000  # Qt 布局极长单行会占满主线程，限制只读预览长度。
 _AUTOSAVE_DELAY_MS = 3000
 _EXTRELOAD_DEBOUNCE_MS = 200   # 外部修改 debounce：避免 VSCode "删除-重命名" 写盘瞬间读到空文件
 _FONT_PT = FONT_PT_CODE   # 编辑器/日志统一字号（走 theme token，改一处全生效）
+
+
+class _SearchCountWorker(BackgroundThread):
+    done = Signal(object, object)
+
+    def __init__(self, text: str, key: tuple, parent=None):
+        super().__init__(parent)
+        self.text, self.key = text, key
+
+    def run(self) -> None:
+        _, query, case_sensitive = self.key
+        options = QRegularExpression.PatternOption.NoPatternOption
+        if not case_sensitive:
+            options |= QRegularExpression.PatternOption.CaseInsensitiveOption
+        rx = QRegularExpression(QRegularExpression.escape(query), options)
+        matches = rx.globalMatch(self.text)
+        positions = array("I")  # Qt 原生 UTF-16 坐标，百万匹配也无需百万 Python 对象。
+        while matches.hasNext():
+            positions.append(matches.next().capturedStart())
+            if len(positions) % 1024 == 0:
+                if self.isInterruptionRequested():
+                    return
+                time.sleep(0)
+        if not self.isInterruptionRequested():
+            self.done.emit(self.key, positions)
 
 def _image_format_for(path: Path) -> str:
     suffix_format = image_suffix_format(path)
@@ -336,12 +367,18 @@ class FilePreviewPane(QWidget):
         #   2. 把 GBK 等非 UTF-8 文件以 UTF-8 写回（内容不可逆损坏）
         self._encoding = "utf-8"
         self._newline = ""  # "" = 保持文本原有的 \n（写入时不转换）
+        self._disk_signature = None
         # 搜索状态去抖：_update_search_status 每次全文 toPlainText+lower+线性扫描，
         # 大文件下挂在 view.textChanged（编辑每字符触发）会卡。停顿 150ms 再算。
         self._search_status_timer = QTimer(self)
         self._search_status_timer.setSingleShot(True)
         self._search_status_timer.setInterval(150)
         self._search_status_timer.timeout.connect(self._update_search_status)
+        self._search_worker = None
+        self._search_key = None
+        self._search_cache_key = None
+        self._search_cache = array("I")
+        self._search_stopped = False
         self._highlighter: PygmentsHighlighter | None = None
         self._image_scroll: QScrollArea | None = None
         self._image_label: QLabel | None = None
@@ -453,12 +490,16 @@ class FilePreviewPane(QWidget):
         """关闭 tab 前调：pending 自动保存立刻落盘。
         返回 True 表示已干净或成功保存；False 表示仍 dirty（保存失败）
         """
-        if self._autosave_timer.isActive():
-            self._autosave_timer.stop()
+        self._autosave_timer.stop()
+        if self._dirty and not self._read_only:
             self._autosave()
         return not self._dirty
 
     def stop_workers(self) -> None:
+        self._search_stopped = True
+        self._search_status_timer.stop()
+        if self._search_worker is not None:
+            self._search_worker.requestInterruption()
         if self._highlighter is not None:
             self._highlighter.stop()
 
@@ -491,20 +532,23 @@ class FilePreviewPane(QWidget):
             return
 
         try:
-            size = p.stat().st_size
-            with p.open("rb") as f:
-                raw = f.read(_MAX_READ_BYTES)
-            self._truncated = size > _MAX_READ_BYTES
+            signature, raw = self._read_snapshot(p)
+            size = signature[1]
+            self._disk_signature = signature
+            self._truncated = size > _MAX_READ_BYTES or len(raw) > _MAX_READ_BYTES
+            raw = raw[:_MAX_READ_BYTES]
             text, self._encoding = detect_encoding(raw)
             # 记录原始行尾，保存时按原样回写；编辑器内部统一用 \n
             self._newline = detect_newline(text)
             text = text.replace("\r\n", "\n").replace("\r", "\n")
+            text, long_line = self._limit_preview_lines(text)
+            self._truncated = self._truncated or long_line
             self.view.setPlainText(text)
             self.view.document().setModified(False)
             self.lbl_path.setText(f"{self._display_path()}  ({_human_size(size)})")
             if self._truncated:
                 self._set_readonly_reason(
-                    f"文件过大（>{_MAX_READ_BYTES // (1024*1024)}MB），只读显示前部",
+                    "文件过大或单行过长，只读显示前部，已禁止覆盖保存",
                     None,
                 )
         except OSError as e:
@@ -707,6 +751,37 @@ class FilePreviewPane(QWidget):
                   newline=self._newline) as f:
             f.write(text)
 
+    @staticmethod
+    def _limit_preview_lines(text: str) -> tuple[str, bool]:
+        start = 0
+        for match in re.finditer("\n", text):
+            if match.start() - start > _MAX_LINE_CHARS:
+                return text[:start + _MAX_LINE_CHARS], True
+            start = match.end()
+        if len(text) - start > _MAX_LINE_CHARS:
+            return text[:start + _MAX_LINE_CHARS], True
+        return text, False
+
+    @staticmethod
+    def _signature(path: Path) -> tuple[int, int]:
+        info = path.stat()
+        return info.st_mtime_ns, info.st_size
+
+    def _read_snapshot(self, path: Path) -> tuple[tuple[int, int], bytes]:
+        signature = self._signature(path)
+        with path.open("rb") as stream:
+            raw = stream.read(_MAX_READ_BYTES + 1)
+        if self._signature(path) != signature:
+            raise OSError("文件正在被外部写入，请稍后重载")
+        return signature, raw
+
+    def _replace_saved_file(self, temporary: Path, path: Path) -> None:
+        if self._disk_signature is not None and self._signature(path) != self._disk_signature:
+            temporary.unlink(missing_ok=True)
+            raise OSError("文件已被外部修改，已保留本地编辑并取消覆盖")
+        temporary.replace(path)
+        self._disk_signature = self._signature(path)
+
     def _autosave(self) -> None:
         if not self._dirty or self._read_only:
             return
@@ -716,7 +791,7 @@ class FilePreviewPane(QWidget):
             self._write_text_preserving(tmp, self.view.toPlainText())
             # 设忽略窗口：watcher 接下来 1 秒内的 fileChanged 是我们自己写的，不要触发重载
             self._ignore_external_until = time.monotonic() + 1.0
-            tmp.replace(p)
+            self._replace_saved_file(tmp, p)
             self.view.document().setModified(False)
             self._dirty = False
             self.dirtyChanged.emit(False)
@@ -725,7 +800,7 @@ class FilePreviewPane(QWidget):
             self.saved.emit(self.path)
             log.debug("自动保存: %s", self.path)
             QTimer.singleShot(1500, self._restore_status_label)
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             log.warning("自动保存失败: %s | %s", self.path, e)
             self.lbl_status.setText("自动保存失败")
             self.lbl_status.setStyleSheet(f"color:{COLOR_ERROR}; padding:0 8px;")
@@ -743,13 +818,13 @@ class FilePreviewPane(QWidget):
             tmp = p.with_suffix(p.suffix + ".minitmp")
             self._write_text_preserving(tmp, self.view.toPlainText())
             self._ignore_external_until = time.monotonic() + 1.0
-            tmp.replace(p)
+            self._replace_saved_file(tmp, p)
             self.view.document().setModified(False)
             self._dirty = False
             self.dirtyChanged.emit(False)
             self.saved.emit(self.path)
             log.info("保存文件: %s", self.path)
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             QMessageBox.warning(self, "保存失败", f"{self.path}\n\n{e}")
             log.error("保存失败: %s | %s", self.path, e)
 
@@ -764,7 +839,7 @@ class FilePreviewPane(QWidget):
         self._extreload_timer.start(_EXTRELOAD_DEBOUNCE_MS)
 
     def _try_external_reload(self) -> None:
-        if self._read_only and not self._not_found:
+        if self._binary or (self._read_only and not self._not_found and not self._truncated):
             return  # 只读（二进制 / 过大 / 读取失败）不参与重载
         p = Path(self.path)
         if not p.exists():
@@ -785,21 +860,35 @@ class FilePreviewPane(QWidget):
 
         # 干净状态：重读文件，保留滚动位置和光标位置
         try:
-            with p.open("rb") as f:
-                raw = f.read(_MAX_READ_BYTES)
-            text = raw.decode("utf-8", errors="replace")
+            signature, raw = self._read_snapshot(p)
+            truncated = signature[1] > _MAX_READ_BYTES or len(raw) > _MAX_READ_BYTES
+            text, encoding = detect_encoding(raw[:_MAX_READ_BYTES])
+            newline = detect_newline(text)
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            text, long_line = self._limit_preview_lines(text)
+            truncated = truncated or long_line
         except OSError as e:
             log.warning("外部修改后重读失败: %s | %s", self.path, e)
             return
 
-        if text == self.view.toPlainText():
+        if text == self.view.toPlainText() and truncated == self._truncated:
+            self._disk_signature = signature
+            self._encoding, self._newline = encoding, newline
             return  # 内容没变（可能是 mtime 触发但内容相同），不动
 
         scroll_v = self.view.verticalScrollBar().value()
         scroll_h = self.view.horizontalScrollBar().value()
         cursor_pos = self.view.textCursor().position()
 
+        self._autosave_timer.stop()
+        self._truncated = truncated
+        self._read_only = truncated
+        self._not_found = False
+        self._disk_signature = signature
+        self._encoding, self._newline = encoding, newline
+        self.view.setReadOnly(truncated)
         self.view.setPlainText(text)
+        self._autosave_timer.stop()
         self.view.document().setModified(False)
         self._dirty = False
         self.dirtyChanged.emit(False)
@@ -810,6 +899,10 @@ class FilePreviewPane(QWidget):
         self.view.setTextCursor(cur)
         self.view.verticalScrollBar().setValue(scroll_v)
         self.view.horizontalScrollBar().setValue(scroll_h)
+
+        if truncated:
+            self._set_readonly_reason("文件过大或单行过长，只读显示前部，已禁止覆盖保存", None)
+            return
 
         self.lbl_status.setText(f"已自动重载 {time.strftime('%H:%M:%S')}")
         self.lbl_status.setStyleSheet(f"color:{COLOR_SUCCESS}; padding:0 8px;")
@@ -853,45 +946,56 @@ class FilePreviewPane(QWidget):
             self.view.find(q, flags)
         self._update_search_status()
 
-    def _search_positions(self, query: str) -> list[int]:
-        if not query:
-            return []
-        text = self.view.toPlainText()
-        haystack = text if self.chk_search_case.isChecked() else text.lower()
-        needle = query if self.chk_search_case.isChecked() else query.lower()
-        positions: list[int] = []
-        start = 0
-        while True:
-            pos = haystack.find(needle, start)
-            if pos < 0:
-                break
-            positions.append(pos)
-            start = pos + max(1, len(needle))
-        return positions
-
     def _schedule_search_status(self) -> None:
-        # 去抖入口：搜索框输入 / 正文编辑都先重置定时器，停顿后才真正算匹配数
+        if self._search_worker is not None:
+            self._search_worker.requestInterruption()
+        self._search_key = None
         self._search_status_timer.start()
 
     def _update_search_status(self) -> None:
+        if self._search_stopped or background_tasks_suspended():
+            return
         q = self.search_input.text()
+        key = (self.view.document().revision(), q, self.chk_search_case.isChecked())
+        self._search_key = key
         if not q:
             self.lbl_search_status.setText("")
             return
-        positions = self._search_positions(q)
+        if key == self._search_cache_key:
+            self._show_search_count()
+            return
+        self.lbl_search_status.setText("统计中…")
+        if self._search_worker is not None:
+            if self._search_worker.key != key:
+                self._search_worker.requestInterruption()
+            return
+        self._start_search_count(key)
+
+    def _start_search_count(self, key: tuple) -> None:
+        worker = _SearchCountWorker(self.view.toPlainText(), key)
+        self._search_worker = worker
+        worker.done.connect(self._on_search_count)
+        worker.finished.connect(self._on_search_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_search_count(self, key, positions) -> None:
+        if self._search_stopped or key != self._search_key:
+            return
+        self._search_cache_key, self._search_cache = key, positions
+        self._show_search_count()
+
+    def _on_search_finished(self) -> None:
+        self._search_worker = None
+        if not self._search_stopped and not background_tasks_suspended() and self._search_key and self._search_key[1] and self._search_key != self._search_cache_key:
+            self._start_search_count(self._search_key)
+
+    def _show_search_count(self) -> None:
+        positions = self._search_cache
         if not positions:
             self.lbl_search_status.setText("无匹配")
             return
-        sel_start = self.view.textCursor().selectionStart()
-        current = 1
-        for i, pos in enumerate(positions, 1):
-            if pos >= sel_start:
-                current = i
-                break
-        else:
-            current = len(positions)
-        if sel_start in positions:
-            current = positions.index(sel_start) + 1
+        current = min(bisect_left(positions, self.view.textCursor().selectionStart()) + 1, len(positions))
         self.lbl_search_status.setText(f"{current}/{len(positions)}")
 
     # ---- 快捷键 ----

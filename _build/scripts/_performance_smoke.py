@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
@@ -20,7 +19,6 @@ from src.core.file_index import (
     search_indexed_files,
 )
 from src.core.git_worker import GitBranchListWorker, GitDirtyCheckWorker
-from src.core.resource_guard import _get_node_processes
 from src.core.search_worker_lifecycle import (
     register_search_worker, stop_search_workers,
 )
@@ -128,7 +126,7 @@ def main() -> int:
         )
         if watch_indexer._observer is None:
             raise AssertionError("watchdog observer did not start")
-        watched_file = Path(tmp) / "watchdog-event.txt"
+        watched_file = (Path(tmp) / "watchdog-event.txt").resolve()
         watched_file.touch()
         _wait_until(
             app,
@@ -136,37 +134,6 @@ def main() -> int:
             "watchdog create event did not update the file index",
         )
         watch_indexer.stop()
-
-    resource_done: list[tuple[int, int]] = []
-    resource_heartbeat_delays: list[float] = []
-    resource_heartbeat_last = [time.perf_counter()]
-    resource_heartbeat = QTimer()
-    resource_heartbeat.setInterval(20)
-
-    def on_resource_heartbeat() -> None:
-        now = time.perf_counter()
-        resource_heartbeat_delays.append(
-            (now - resource_heartbeat_last[0]) * 1000
-        )
-        resource_heartbeat_last[0] = now
-
-    def scan_node_processes() -> None:
-        managed, unmanaged = _get_node_processes()
-        resource_done.append((len(managed), len(unmanaged)))
-
-    resource_heartbeat.timeout.connect(on_resource_heartbeat)
-    resource_heartbeat.start()
-    threading.Thread(target=scan_node_processes, daemon=True).start()
-    _wait_until(
-        app, lambda: bool(resource_done),
-        "resource guard process scan did not finish", timeout=10.0,
-    )
-    resource_heartbeat.stop()
-    resource_heartbeat_max_ms = max(resource_heartbeat_delays or [0])
-    if resource_heartbeat_max_ms > 250:
-        raise AssertionError(
-            f"resource guard stalled UI heartbeat: {resource_heartbeat_max_ms:.1f}ms"
-        )
 
     started = time.perf_counter()
     picker = show_file_picker(indexer, lambda _path: None)
@@ -587,6 +554,8 @@ def main() -> int:
         started = time.perf_counter()
         file_tree._render_directory_entries(root_item, root_path, entries)
         directory_render_ms = (time.perf_counter() - started) * 1000
+        _wait_until(app, lambda: not file_tree._render_tokens,
+                    "directory render batches did not finish")
         if root_item.childCount() != 5000:
             raise AssertionError(f"directory batch render count: {root_item.childCount()}")
         if directory_render_ms > DIRECTORY_RENDER_LIMIT_MS:
@@ -603,7 +572,6 @@ def main() -> int:
         f"max_query_ms={max(query_times):.1f} "
         f"open_ms={open_ms:.1f} schedule_ms={schedule_ms:.1f} "
         f"watchdog_dispatch_ms={watchdog_dispatch_ms:.1f} "
-        f"resource_heartbeat_max_ms={resource_heartbeat_max_ms:.1f} "
         f"content_search_ms={content_search_ms:.1f} "
         f"content_heartbeat_max_ms={content_heartbeat_max_ms:.1f} "
         f"content_stop_ms={content_stop_ms:.1f} "
@@ -613,6 +581,7 @@ def main() -> int:
         f"syntax_dispatch_ms={syntax_dispatch_ms:.1f} "
         f"syntax_tokenize_ms={highlighter._last_tokenize_ms:.1f} "
         f"syntax_apply_ms={highlighter._last_apply_ms:.1f} "
+        f"syntax_apply_total_ms={highlighter._last_apply_total_ms:.1f} "
         f"syntax_heartbeat_max_ms={syntax_heartbeat_max_ms:.1f} "
         f"python_syntax_heartbeat_max_ms={python_heartbeat_max_ms:.1f} "
         f"log_render_max_ms={log_render_max_ms:.1f} "

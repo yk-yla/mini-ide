@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.file_index import FileSearchWorker
-from src.core.search_worker_lifecycle import register_search_worker
+from src.core.search_worker_lifecycle import register_search_worker, background_tasks_suspended
 from src.ui.theme import (
     ACCENT, ACCENT_SUBTLE, BG_CODE, BG_L1, BG_L2, BG_L4,
     BORDER_STRONG, BORDER_SUBTLE, FG_BRIGHT, FG_DIM, FG_PRIMARY, FG_SECONDARY,
@@ -239,6 +239,8 @@ class PickerDialog(QDialog):
             self.list.setUpdatesEnabled(True)
 
     def _start_async_refresh(self, query: str) -> None:
+        if background_tasks_suspended():
+            return
         self._cancel_search_workers()
         self._search_generation += 1
         generation = self._search_generation

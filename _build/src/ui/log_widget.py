@@ -31,7 +31,7 @@ def _strip_ansi(text: str) -> str:
 from PySide6.QtCore import Qt, QTimer, Signal, QUrl, QRegularExpression
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QFont, QTextCharFormat,
-    QTextCursor, QTextDocument, QKeySequence, QMouseEvent,
+    QTextCursor, QTextDocument, QKeySequence, QMouseEvent, QTextBlockUserData, QTextLayout,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMenu,
@@ -49,6 +49,10 @@ from src.ui.theme import (
 
 
 LOG_FLUSH_BATCH_SIZE = 500
+LOG_FLUSH_BUDGET_SECONDS = 0.008
+LOG_PENDING_CHARS = 2_000_000
+LOG_LINE_CHARS = 20_000
+SQL_FORMAT_CHARS = 4_096
 perf_log = logging.getLogger("mini-ide.performance")
 
 
@@ -63,6 +67,52 @@ class LineMeta:
     diagnosis: str = ""
 
 
+class LogBlockData(QTextBlockUserData):
+    def __init__(self, meta: LineMeta):
+        super().__init__()
+        self.meta = meta
+        self.theme_generation = -1
+
+
+def _block_meta(block) -> LineMeta | None:
+    data = block.userData()
+    return data.meta if isinstance(data, LogBlockData) else None
+
+
+class _LogTextEdit(QPlainTextEdit):
+    """颜色属于视图：只给本次要画的 block 设置 layout 格式。"""
+
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def paintEvent(self, event) -> None:
+        block = self.firstVisibleBlock()
+        bottom = self.viewport().height()
+        while block.isValid():
+            y = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
+            if y > bottom:
+                break
+            data = block.userData()
+            if isinstance(data, LogBlockData) and data.theme_generation != self.owner._theme_generation:
+                ranges = []
+                base = QTextLayout.FormatRange()
+                base.start, base.length = 0, block.length() - 1
+                base.format = self.owner._fmt.get(data.meta.kind, self.owner._fmt["plain"])
+                ranges.append(base)
+                text = block.text()
+                for jump in data.meta.jumps:
+                    fmt = QTextLayout.FormatRange()
+                    fmt.start = len(text[:jump.start].encode("utf-16-le")) // 2
+                    fmt.length = len(text[jump.start:jump.end].encode("utf-16-le")) // 2
+                    fmt.format = self.owner._fmt_link
+                    ranges.append(fmt)
+                block.layout().setFormats(ranges)
+                data.theme_generation = self.owner._theme_generation
+            block = block.next()
+        super().paintEvent(event)
+
+
 class LogWidget(QWidget):
     """日志区：顶部一条工具条 + 中间日志 + 底部搜索条"""
 
@@ -72,7 +122,7 @@ class LogWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._ctx = lc.LineContext()
-        self._lines: list[LineMeta] = []       # 每一块的元数据（与文档 block 一一对应）
+        self._theme_generation = 0
         self._error_count = 0
         self._warn_count = 0
         self._log_file: Path | None = None
@@ -88,7 +138,9 @@ class LogWidget(QWidget):
 
         # 批量刷新：高吞吐日志（如 Gradle 初扫）会飙到 1000+行/秒，
         # 单行 insert 会卡主线程。把接收到的行先塞到队列，每 50ms 集中写入一次。
-        self._pending: deque[tuple[str, str]] = deque()
+        self._pending: deque[tuple[str, LineMeta]] = deque()
+        self._pending_chars = 0
+        self._display_skipped = 0
         self._flush_timer = QTimer(self)
         self._flush_timer.setInterval(50)
         self._flush_timer.timeout.connect(self._flush_pending)
@@ -123,7 +175,7 @@ class LogWidget(QWidget):
 
         root.addWidget(self.toolbar)
 
-        self.edit = QPlainTextEdit()
+        self.edit = _LogTextEdit(self)
         self.edit.setReadOnly(True)
         self.edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         # 默认 10000 行，可通过 AppConfig.max_log_blocks 调整（LogWidget 不直接依赖 config，
@@ -207,24 +259,8 @@ class LogWidget(QWidget):
 
     def refresh_theme(self) -> None:
         self._apply_formats()
-        document = self.edit.document()
-        block = document.firstBlock()
-        while block.isValid():
-            index = block.blockNumber()
-            meta = self._lines[index] if index < len(self._lines) else None
-            cursor = QTextCursor(block)
-            cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
-            cursor.setCharFormat(self._fmt.get(meta.kind if meta else "plain", self._fmt["plain"]))
-            if meta:
-                for jump in meta.jumps:
-                    link_cursor = QTextCursor(document)
-                    link_cursor.setPosition(block.position() + jump.start)
-                    link_cursor.setPosition(
-                        block.position() + jump.end,
-                        QTextCursor.MoveMode.KeepAnchor,
-                    )
-                    link_cursor.setCharFormat(self._fmt_link)
-            block = block.next()
+        self._theme_generation += 1
+        self.edit.viewport().update()
         self._update_counts(None)
 
     # ---- 对外 API ----
@@ -248,7 +284,7 @@ class LogWidget(QWidget):
         self._new_run = True          # 新运行开始，下次 flush 强制滚到底部
         self.diagnosis_bar.setVisible(False)
         self._close_log_file()
-        ts = time.strftime("%Y%m%d-%H%M%S")
+        ts = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000_000:09d}"
         safe_label = re.sub(r"[^\w\-.]+", "_", label)
         self._log_file = LOG_DIR / f"{safe_label}_{ts}.log"
         try:
@@ -326,12 +362,36 @@ class LogWidget(QWidget):
         self.contentAdded.emit()
         if "\x1b" in line:
             line = _strip_ansi(line)
-        self._pending.append((stream, line))
+        # 原始内容不受视图容量限制；分类也在淘汰显示之前完成。
         if self._persistent_fh:
             try:
                 self._persistent_fh.write(line + "\n")
             except OSError:
                 pass
+        cls = lc.classify(line, self._ctx)
+        meta = LineMeta(cls.kind, stream, cls.jumps, cls.stack_group_id, cls.diagnosis)
+        if cls.kind in ("error", "caused_by"):
+            self._error_count += 1
+            if not self._first_error:
+                self._first_error = line[:LOG_LINE_CHARS]
+        elif cls.kind == "warn":
+            self._warn_count += 1
+        if cls.kind == "startup_ready":
+            self._ready_seen = True
+        if cls.diagnosis and cls.diagnosis != self._last_diagnosis:
+            self._last_diagnosis = cls.diagnosis
+            self._show_diagnosis(cls.diagnosis)
+        display = line
+        if len(display) > LOG_LINE_CHARS:
+            display = display[:LOG_LINE_CHARS] + " …（显示已截断，完整内容见日志文件）"
+            meta = replace(meta, jumps=[j for j in meta.jumps if j.end <= LOG_LINE_CHARS])
+        self._pending.append((display, meta))
+        self._pending_chars += len(display)
+        limit = self.edit.maximumBlockCount()
+        while len(self._pending) > limit or self._pending_chars > LOG_PENDING_CHARS:
+            skipped, _ = self._pending.popleft()
+            self._pending_chars -= len(skipped)
+            self._display_skipped += 1
         if not self._flush_timer.isActive():
             self._flush_timer.start()
 
@@ -340,59 +400,33 @@ class LogWidget(QWidget):
             self._flush_timer.stop()
             return
         started = time.perf_counter()
-        batch = [
-            self._pending.popleft()
-            for _ in range(min(LOG_FLUSH_BATCH_SIZE, len(self._pending)))
-        ]
-
-        # 插入前采样：用户当前是否贴在底部。只有贴底时才在 flush 后自动跟随到
-        # 最新——否则用户往上翻看历史会被每 50ms 一次的 flush 反复拽回底部。
         sb = self.edit.verticalScrollBar()
         was_at_bottom = sb.value() >= sb.maximum() - 4
-
         self.edit.setUpdatesEnabled(False)
+        rendered = 0
         try:
-            for stream, line in batch:
-                cls = lc.classify(line, self._ctx)
-                meta = LineMeta(
-                    kind=cls.kind,
-                    stream=stream,
-                    jumps=cls.jumps,
-                    stack_group=cls.stack_group_id,
-                    diagnosis=cls.diagnosis,
-                )
-                display_line = line
-                if cls.kind == "sql" and ";" in line:
-                    display_line = _format_sql(line)
-
-                self._insert_block(display_line, meta, cls)
-                if cls.kind == "error" or cls.kind == "caused_by":
-                    self._error_count += 1
-                    if not self._first_error:
-                        self._first_error = line
-                elif cls.kind == "warn":
-                    self._warn_count += 1
-                if cls.kind == "startup_ready":
-                    self._ready_seen = True
-                if cls.diagnosis and cls.diagnosis != self._last_diagnosis:
-                    self._last_diagnosis = cls.diagnosis
-                    self._show_diagnosis(cls.diagnosis)
-                if self._hide_stack and cls.kind == "stack" and bool(meta.stack_group):
-                    self.edit.document().lastBlock().setVisible(False)
+            while self._pending and rendered < LOG_FLUSH_BATCH_SIZE:
+                line, meta = self._pending.popleft()
+                self._pending_chars -= len(line)
+                display = _format_sql(line) if meta.kind == "sql" and ";" in line else line
+                self._insert_block(display, meta)
+                rendered += 1
+                if time.perf_counter() - started >= LOG_FLUSH_BUDGET_SECONDS:
+                    break
+            # 同时限制行数和字符数，避免少量巨大行占满内存。
+            doc = self.edit.document()
+            if doc.characterCount() > LOG_PENDING_CHARS:
+                boundary = doc.findBlock(doc.characterCount() - LOG_PENDING_CHARS)
+                cursor = QTextCursor(doc)
+                cursor.setPosition(boundary.position())
+                cursor.movePosition(QTextCursor.MoveOperation.Start, QTextCursor.MoveMode.KeepAnchor)
+                cursor.removeSelectedText()
         finally:
             self.edit.setUpdatesEnabled(True)
-
-        # 批次末尾统一刷新一次计数；新运行开始或用户贴底时跟随滚动到最新
         self._update_counts(None)
         if self._new_run or was_at_bottom:
             self._new_run = False
             sb.setValue(sb.maximum())
-
-        # Qt 文档超限时会自动淘汰头部旧块，同步截断 _lines 保持一致
-        max_blocks = self.edit.maximumBlockCount()
-        if max_blocks > 0 and len(self._lines) > max_blocks:
-            self._lines = self._lines[-max_blocks:]
-
         if self._persistent_fh:
             try:
                 self._persistent_fh.flush()
@@ -400,10 +434,7 @@ class LogWidget(QWidget):
                 pass
         duration_ms = (time.perf_counter() - started) * 1000
         if duration_ms >= 100:
-            perf_log.warning(
-                "perf op=log-render duration_ms=%.1f files=%d status=slow",
-                duration_ms, len(batch),
-            )
+            perf_log.warning("perf op=log-render duration_ms=%.1f files=%d status=slow", duration_ms, rendered)
 
     def clear(self) -> None:
         if self._flush_timer.isActive():
@@ -411,7 +442,8 @@ class LogWidget(QWidget):
         self._pending.clear()
         self._ctx = lc.LineContext()
         self.edit.clear()
-        self._lines.clear()
+        self._pending_chars = 0
+        self._display_skipped = 0
         self._error_count = 0
         self._warn_count = 0
         self._last_diagnosis = ""
@@ -431,7 +463,7 @@ class LogWidget(QWidget):
         in_stack = False
         current_group = ""
         while block.isValid():
-            meta = self._lines[idx] if idx < len(self._lines) else None
+            meta = _block_meta(block)
             if meta:
                 if meta.kind in ("error", "caused_by"):
                     out_lines.append(block.text())
@@ -443,6 +475,7 @@ class LogWidget(QWidget):
                     total_chars += len(block.text())
                 elif meta.kind == "warn" and not in_stack:
                     out_lines.append(block.text())
+                    total_chars += len(block.text())
                 else:
                     if in_stack and meta.kind not in ("stack", "caused_by"):
                         in_stack = False
@@ -459,46 +492,24 @@ class LogWidget(QWidget):
 
     # ---- 内部：插入与着色 ----
 
-    def _insert_block(self, line: str, meta: LineMeta, cls: lc.Classification) -> None:
-        cursor = self.edit.textCursor()
+    def _insert_block(self, line: str, meta: LineMeta, cls=None) -> None:
+        cursor = QTextCursor(self.edit.document())
         cursor.movePosition(QTextCursor.MoveOperation.End)
-
-        # 新段
-        if self.edit.document().blockCount() > 0 and self.edit.document().characterCount() > 1:
-            cursor.insertBlock()
-
-        base_fmt = self._fmt.get(meta.kind, self._fmt["plain"])
-
-        # 记录插入前的 block 数：line 可能含 \n（如 SQL 被美化成多行），
-        # insertText 会把它拆成多个文档 block。下面用实际增量补齐 _lines，
-        # 保证 _lines 与文档 block 严格一一对应——否则之后所有按 block 索引的
-        # 双击跳转 / 异常上下文收集都会从这条多行日志起整体错位。
-        blocks_before = self.edit.document().blockCount()
-
-        # 分段插入：把 jump 部分用 link 样式，其他用基础样式
-        if meta.jumps:
-            last_end = 0
-            for j in sorted(meta.jumps, key=lambda x: x.start):
-                if j.start > last_end:
-                    cursor.insertText(line[last_end:j.start], base_fmt)
-                cursor.insertText(line[j.start:j.end], self._fmt_link)
-                last_end = j.end
-            if last_end < len(line):
-                cursor.insertText(line[last_end:], base_fmt)
-        else:
-            cursor.insertText(line, base_fmt)
-
-        # 块用户数据
-        block = cursor.block()
-        block.setUserState(_kind_to_state(meta.kind))
-        # 与文档 block 一一对应：首块挂真实 meta，多出来的续块挂无 jump 的
-        # 副本（续行的 jump 偏移是按整行算的，对拆分后的子行无意义，置空避免误跳）。
-        added = self.edit.document().blockCount() - blocks_before
-        self._lines.append(meta)
-        if added > 0:
-            cont_meta = replace(meta, jumps=[]) if meta.jumps else meta
-            for _ in range(added):
-                self._lines.append(cont_meta)
+        offset = 0
+        for part in re.split(r"[\n\r\u2028\u2029]", line):
+            if cursor.block().userData() is not None or self.edit.document().characterCount() > 1:
+                cursor.insertBlock()
+            jumps = [replace(j, start=j.start-offset, end=j.end-offset) for j in meta.jumps
+                     if offset <= j.start and j.end <= offset + len(part)]
+            block_meta = replace(meta, jumps=jumps)
+            cursor.insertText(part)
+            block = cursor.block()
+            block.setUserData(LogBlockData(block_meta))
+            block.setUserState(_kind_to_state(meta.kind))
+            if self._hide_stack and meta.kind == "stack" and meta.stack_group:
+                block.setVisible(False)
+                block.setLineCount(0)
+            offset += len(part) + 1
 
     def _update_counts(self, cls: lc.Classification | None) -> None:
         # 计数已在 _flush_pending 里累加，这里只更新 UI 标签
@@ -509,6 +520,8 @@ class LogWidget(QWidget):
             parts.append(f"<span style='color:{COLOR_WARN};'>⚠ {self._warn_count} warnings</span>")
         if not parts:
             parts.append(f"<span style='color:{FG_SECONDARY};'>0 errors</span>")
+        if self._display_skipped:
+            parts.append(f"显示跳过 {self._display_skipped} 条积压；完整内容见日志文件")
         self.lbl_counts.setText("  ".join(parts))
 
     def _show_diagnosis(self, text: str) -> None:
@@ -520,11 +533,11 @@ class LogWidget(QWidget):
 
     def _on_double_click(self, event: QMouseEvent) -> None:
         cursor = self.edit.cursorForPosition(event.position().toPoint())
-        block_num = cursor.block().blockNumber()
-        if block_num < len(self._lines) and self._lines[block_num].jumps:
+        meta = _block_meta(cursor.block())
+        if meta and meta.jumps:
             # 取最近的 jump
-            col = cursor.columnNumber()
-            jumps = self._lines[block_num].jumps
+            col = len(cursor.block().text().encode("utf-16-le")[:cursor.columnNumber() * 2].decode("utf-16-le", errors="ignore"))
+            jumps = meta.jumps
             target = min(jumps, key=lambda j: abs(((j.start + j.end) // 2) - col))
             self.fileJumpRequested.emit(target.path, target.line, target.column)
             return
@@ -533,8 +546,7 @@ class LogWidget(QWidget):
 
     def _on_context_menu(self, pos) -> None:
         cursor = self.edit.cursorForPosition(pos)
-        block_num = cursor.block().blockNumber()
-        meta = self._lines[block_num] if block_num < len(self._lines) else None
+        meta = _block_meta(cursor.block())
 
         menu = QMenu(self)
         menu.addAction("复制当前行", lambda: self._copy_line(cursor))
@@ -650,6 +662,8 @@ def _kind_to_state(kind: str) -> int:
 
 def _format_sql(line: str) -> str:
     """简单 SQL 美化：Hibernate 的一行 SQL 变成多行缩进"""
+    if len(line) > SQL_FORMAT_CHARS:
+        return line
     try:
         import sqlparse  # type: ignore
     except ImportError:
@@ -658,9 +672,24 @@ def _format_sql(line: str) -> str:
     if not m:
         return line
     prefix, sql = m.group(1), m.group(2)
-    formatted = sqlparse.format(
-        sql, reindent=True, keyword_case="upper", indent_width=2, use_space_around_operators=True
-    )
-    lines = formatted.splitlines() or [sql]
-    head, tail = lines[0], lines[1:]
-    return f"{prefix}: {head}" + ("\n    " + "\n    ".join(tail) if tail else "")
+    # 只做词法换行，不构造 SQL 分组树；字符串和注释 token 原样保留。
+    if len(sql) > LOG_LINE_CHARS:
+        return line
+    from sqlparse import tokens as T
+    out = []
+    depth = 0
+    for token, value in sqlparse.lexer.tokenize(sql):
+        if token in T.Keyword:
+            value = value.upper()
+            if depth == 0 and value in {"FROM", "WHERE", "GROUP BY", "ORDER BY", "HAVING", "LIMIT", "VALUES", "SET"}:
+                out.append("\n    ")
+        if token in T.Punctuation:
+            if value == "(":
+                depth += 1
+            elif value == ")":
+                depth = max(0, depth - 1)
+            elif value == "," and depth == 0:
+                out.append(",\n    ")
+                continue
+        out.append(value)
+    return f"{prefix}: " + "".join(out)

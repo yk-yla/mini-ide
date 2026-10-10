@@ -164,6 +164,7 @@ def _parse_args(argv: list[str]) -> dict | None:
 
     cmd_name = args[0].lstrip("-")  # --list-projects → list-projects
     cmd_map = {
+        "version": "version",
         "status": "status",
         "list-projects": "list-projects",
         "list-modules": "list-modules",
@@ -201,6 +202,9 @@ def _parse_args(argv: list[str]) -> dict | None:
 
     result: dict = {"cmd": cmd_map[cmd_name]}
     rest = args[1:]
+
+    if cmd_name == "version":
+        return result if not rest else None
 
     if cmd_name in ("status", "list-projects", "list-workspaces", "close-workspace",
                     "list-aggregates", "can-quit"):
@@ -471,12 +475,15 @@ def _parse_args(argv: list[str]) -> dict | None:
 def _response_timeout_ms(cmd: dict) -> int:
     """按命令生命周期设置 IPC 等待时间。"""
     action = cmd["cmd"]
+    if action == "quit":
+        return 120000
     if action in (
         "health", "compile", "ensure-running",
         "create-development-workspace", "workspace-review", "workspace-delete-check",
         "workspace-commit-push", "workspace-sync",
-    ) or (action in ("start", "restart") and cmd.get("wait")):
+    ) or action in ("start", "stop", "restart"):
         defaults = {
+            "start": 60, "stop": 60, "restart": 60,
             "create-development-workspace": 600,
             "workspace-commit-push": 600,
             "workspace-sync": 600,
@@ -530,6 +537,11 @@ def run_cli(argv: list[str]) -> int:
         _safe_write(sys.stderr, json.dumps({"ok": False, "error": "invalid arguments"}) + "\n")
         _print_usage()
         return EXIT_BAD_ARGS
+
+    if cmd["cmd"] == "version":
+        from src.core.app_version import build_info
+        _safe_write(sys.stdout, json.dumps({"ok": True, **build_info()}, ensure_ascii=False) + "\n")
+        return EXIT_OK
 
     # quit / preflight-build / status 不触发自动启动
     if cmd["cmd"] in {"quit", "preflight-build", "status"}:
@@ -598,6 +610,7 @@ def _print_usage():
         "Usage: mini-ide <command> [args...]\n"
         "Commands:\n"
         "  --status                     Snapshot IDE/projects/services/workspaces\n"
+        "  --version                    Show this CLI package version without connecting to GUI\n"
         "  --list-projects              List all open projects\n"
         "  --list-modules <project>     List modules of a project\n"
         "  --list-runtimes <project>    List runtime units of a project\n"

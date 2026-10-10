@@ -1,6 +1,8 @@
 """需求工作区创建向导：选择会修改的项目并预览创建计划。"""
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread
+
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, Signal
@@ -15,7 +17,7 @@ from src.core.development_workspace_service import build_workspace_creation_plan
 from src.ui.theme import GAP_LG, GAP_MD, GAP_SM, H_DIALOG_TALL, H_TABLE_ROW, W_DIALOG_WIDE
 
 
-class _WorkspacePlanWorker(QThread):
+class _WorkspacePlanWorker(BackgroundThread):
     done = Signal(object, str)
 
     def __init__(

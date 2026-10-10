@@ -1,6 +1,8 @@
 """聚合项目定义确认与编辑对话框。"""
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread
+
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Qt, Signal
@@ -21,7 +23,7 @@ from src.ui.theme import (
 )
 
 
-class _ComponentDetectWorker(QThread):
+class _ComponentDetectWorker(BackgroundThread):
     done = Signal(object, str)
 
     def __init__(
@@ -42,7 +44,7 @@ class _ComponentDetectWorker(QThread):
             self.done.emit(None, str(exc))
 
 
-class _AggregateScanWorker(QThread):
+class _AggregateScanWorker(BackgroundThread):
     done = Signal(object, str)
 
     def __init__(self, aggregate_root: str, workspace_directory: str, parent=None):

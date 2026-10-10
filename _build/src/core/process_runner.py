@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -15,15 +16,17 @@ import time
 from dataclasses import dataclass, field
 
 import psutil
-from PySide6.QtCore import QObject, QProcess, Signal
+from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
 from src.util import app_log
+from src.core.output_queue import OutputQueue
 
 log = app_log.get_logger("runner")
 
 
 STREAM_STDOUT = "stdout"
 STREAM_STDERR = "stderr"
+_LINE_BREAK = re.compile(rb"\r\n|\r|\n")
 
 
 @dataclass
@@ -53,6 +56,13 @@ class ProcessRunner(QObject):
         self._stdout_buf = b""
         self._stderr_buf = b""
         self._stop_thread: threading.Thread | None = None
+        self._output_queue = OutputQueue()
+        self.destroyed.connect(self._output_queue.close)
+        self._output_timer = QTimer(self)
+        self._output_timer.setInterval(1)
+        self._output_timer.timeout.connect(self._emit_output_batch)
+        self._pending_finish: int | None = None
+        self._process_exit = None
 
     # ---- public API ----
 
@@ -83,17 +93,16 @@ class ProcessRunner(QObject):
         return time.time() - self._started_at
 
     def start(self, command: list[str], ctx: RunContext) -> bool:
-        """启动进程。返回是否启动成功（已在运行时返回 False）"""
+        """受理启动；实际启动/失败由 started/finished 信号报告。"""
         # stopping 时 is_running() 已是 False，但旧进程树的后台清理还没结束。
         # 此时复用 runner 会覆盖 self._proc，并让旧、新进程的 finished 信号串台。
         # 只有完全回到 idle 且清理线程结束，才允许下一轮启动。
-        if self._state != "idle" or self.stop_cleanup_pending():
+        if self._state != "idle" or self.stop_cleanup_pending() or self._output_queue:
             return False
 
         env = _build_child_env(ctx)
 
-        # 在任何可能让 Qt 处理事件的启动等待之前先占住 runner。否则
-        # waitForStarted() 期间另一个 CLI 请求仍会看到 idle，并复用同一 runner。
+        # 立即占住 runner；启动完成由 QProcess.started 接续，不等待外部进程。
         self._set_state("starting")
 
         full_cmd = list(command) + list(ctx.extra_args or [])
@@ -114,10 +123,13 @@ class ProcessRunner(QObject):
         self._proc.readyReadStandardError.connect(self._on_stderr)
         self._proc.finished.connect(self._on_finished)
         self._proc.errorOccurred.connect(self._on_error)
+        self._proc.started.connect(self._on_started)
 
         self._stdout_buf = b""
         self._stderr_buf = b""
         self._manually_stopped = False
+        self._last_start_error = ""
+        self._process_exit = None
 
         # Windows 下 .bat/.cmd 脚本必须通过 cmd /c 启动
         # 把已经清洗过的 env 传进去，用干净的 PATH 解析命令名，避免吃到 mini-ide 自己的 venv
@@ -125,19 +137,15 @@ class ProcessRunner(QObject):
         log.info("启动进程: %s %s | cwd=%s | profile=%s | jvm=%s",
                  program, " ".join(args), ctx.cwd, ctx.spring_profile, ctx.jvm_opts)
         self._proc.start(program, args)
-        if not self._proc.waitForStarted(5000):
-            err = self._proc.errorString() or "(未知原因)"
-            log.error("进程启动失败: %s | error=%s | args=%s", program, err, args)
-            self.outputLine.emit(STREAM_STDERR, f"[启动失败] {program} 无法启动：{err}")
-            self.outputLine.emit(STREAM_STDERR, f"  完整命令: {program} {' '.join(args)}")
-            self.outputLine.emit(STREAM_STDERR, f"  工作目录: {ctx.cwd}")
-            self._set_state("idle")
-            return False
-
         self._started_at = time.time()
+        return True
+
+    def _on_started(self) -> None:
+        if self._state == "stopping":
+            self._proc.kill()
+            return
         self._set_state("running")
         self.started.emit()
-        return True
 
     def stop(self, timeout_ms: int = 5000) -> None:
         """优雅停止：先 SIGTERM 整棵进程树，超时则 SIGKILL。
@@ -145,8 +153,8 @@ class ProcessRunner(QObject):
         杀进程树（psutil terminate + wait_procs 最长 timeout_ms）放到后台线程跑，
         本方法立即返回——否则进程顽固不退时主线程会冻结到 5 秒。状态先置 stopping，
         is_running() 立刻转 False、UI 即时响应；进程真正退出后 QProcess 的 finished
-        信号仍在主线程触发 _on_finished 收回 idle，CLI 端 _wait_runner_stop 的
-        processEvents 轮询照常工作（只是不再阻塞在 wait_procs 上）。
+        信号仍在主线程触发 _on_finished 收回 idle；controller 定时检查
+        idle、后台清理和端口释放后，才确认停止或接续重启。
         """
         if not self._proc or self._state not in ("starting", "running"):
             return
@@ -170,55 +178,96 @@ class ProcessRunner(QObject):
         self._state = s
         self.stateChanged.emit(s)
 
-    def _drain(self, buf_attr: str, new_data: bytes, stream: str) -> None:
-        """把字节流按行切分发射（处理 CRLF/CR/LF 和半行）"""
+    def _drain(self, buf_attr: str, new_data: bytes, stream: str, *, final=False) -> None:
+        """线性拆行；CRLF 跨读取批次时保留末尾 CR，输出由 timer 分批发送。"""
         buf = getattr(self, buf_attr) + new_data
-        while True:
-            idx = -1
-            for sep in (b"\r\n", b"\n", b"\r"):
-                pos = buf.find(sep)
-                if pos >= 0 and (idx < 0 or pos < idx):
-                    idx = pos
-                    sep_len = len(sep)
-            if idx < 0:
+        start = 0
+        for match in _LINE_BREAK.finditer(buf):
+            if not final and match.start() == len(buf) - 1 and buf.endswith(b"\r"):
                 break
-            line = buf[:idx].decode("utf-8", errors="replace")
-            buf = buf[idx + sep_len:]
-            self.outputLine.emit(stream, line)
-        setattr(self, buf_attr, buf)
+            self._output_queue.append((stream, buf[start:match.start()]))
+            start = match.end()
+        setattr(self, buf_attr, buf[start:])
+        if self._output_queue and not self._output_timer.isActive():
+            self._output_timer.start()
+
+    def _emit_output_batch(self) -> None:
+        stdout_pending = self._read_output(STREAM_STDOUT)
+        stderr_pending = self._read_output(STREAM_STDERR)
+        more_input = stdout_pending or stderr_pending
+        if self._process_exit is not None and not more_input:
+            code, elapsed, tag = self._process_exit
+            self._process_exit = None
+            self._flush_remaining()
+            self._output_queue.append(("meta", f"[进程结束] {tag}  耗时 {elapsed:.1f}s".encode("utf-8")))
+            self._pending_finish = code
+        deadline = time.perf_counter() + 0.008
+        for _ in range(500):
+            if not self._output_queue:
+                break
+            stream, raw = self._output_queue.popleft()
+            self.outputLine.emit(stream, raw.decode("utf-8", errors="replace"))
+            if time.perf_counter() >= deadline:
+                break
+        if self._output_queue or more_input:
+            return
+        self._output_timer.stop()
+        if self._pending_finish is not None:
+            code = self._pending_finish
+            self._pending_finish = None
+            self._started_at = 0.0
+            proc, self._proc = self._proc, None
+            if proc is not None:
+                proc.deleteLater()
+            self._set_state("idle")
+            self.finished.emit(code)
 
     def _flush_remaining(self) -> None:
         for attr, stream in (("_stdout_buf", STREAM_STDOUT), ("_stderr_buf", STREAM_STDERR)):
+            self._drain(attr, b"", stream, final=True)
             remaining = getattr(self, attr)
             if remaining:
-                self.outputLine.emit(stream, remaining.decode("utf-8", errors="replace"))
+                self._output_queue.append((stream, remaining))
                 setattr(self, attr, b"")
+        if self._output_queue:
+            self._output_timer.start()
 
     def _on_stdout(self) -> None:
-        if self._proc:
-            data = bytes(self._proc.readAllStandardOutput().data())
-            self._drain("_stdout_buf", data, STREAM_STDOUT)
+        self._read_output(STREAM_STDOUT)
 
     def _on_stderr(self) -> None:
+        self._read_output(STREAM_STDERR)
+
+    def _read_output(self, stream: str) -> bool:
         if self._proc:
-            data = bytes(self._proc.readAllStandardError().data())
-            self._drain("_stderr_buf", data, STREAM_STDERR)
+            channel = (QProcess.ProcessChannel.StandardOutput if stream == STREAM_STDOUT
+                       else QProcess.ProcessChannel.StandardError)
+            self._proc.setReadChannel(channel)
+            data = bytes(self._proc.read(64 * 1024))
+            if data:
+                self._drain("_stdout_buf" if stream == STREAM_STDOUT else "_stderr_buf", data, stream)
+            more = self._proc.bytesAvailable() > 0
+            if more and not self._output_timer.isActive():
+                self._output_timer.start()
+            return more
+        return False
 
     def _on_finished(self, exit_code: int, _status) -> None:
-        self._flush_remaining()
         code = -1 if self._manually_stopped else int(exit_code)
         elapsed = self.elapsed_seconds()
         tag = "已手动停止" if self._manually_stopped else (f"退出码 {exit_code}")
         log.info("进程结束: exit=%s manual=%s elapsed=%.1fs",
                  exit_code, self._manually_stopped, elapsed)
-        self.outputLine.emit("meta", f"[进程结束] {tag}  耗时 {elapsed:.1f}s")
-        self._started_at = 0.0
-        self._set_state("idle")
-        self.finished.emit(code)
+        self._process_exit = (code, elapsed, tag)
+        self._output_timer.start()
 
     def _on_error(self, err) -> None:
         log.error("进程错误: %s", err)
         self.outputLine.emit(STREAM_STDERR, f"[进程错误] {err}")
+        if err == QProcess.ProcessError.FailedToStart:
+            self._last_start_error = self._proc.errorString() if self._proc else str(err)
+            self._pending_finish = -2
+            self._output_timer.start()
 
 
 # ---------- helpers ----------

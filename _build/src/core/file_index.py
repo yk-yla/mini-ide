@@ -5,6 +5,8 @@ watchdog 订阅文件系统变化，自动增量更新。忽略常见的生成�
 """
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread, background_tasks_suspended
+
 import heapq
 import logging
 import os
@@ -78,6 +80,8 @@ class FileIndexer(QObject):
         self._worker: _IndexWorker | None = None
         self._watchdog_worker: _WatchdogStartWorker | None = None
         self._stopping = False
+        self._watchdog_restart_requested = False
+        self._scan_restart_requested = False
         self._ready = False
         self._complete = False
         self._scan_started = 0.0
@@ -85,6 +89,8 @@ class FileIndexer(QObject):
     # ---- public ----
 
     def start_async_scan(self) -> None:
+        if background_tasks_suspended():
+            return
         if self._worker and self._worker.isRunning():
             return
         self._ready = False
@@ -93,7 +99,16 @@ class FileIndexer(QObject):
         self._scan_started = time.perf_counter()
         self._worker = _IndexWorker(str(self.root), self._excluded_roots)
         self._worker.done.connect(self._apply_snapshot)
+        self._worker.finished.connect(self._on_index_worker_finished)
+        self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
+
+    def _on_index_worker_finished(self) -> None:
+        if self.sender() is self._worker:
+            self._worker = None
+            if self._scan_restart_requested and not self._stopping:
+                self._scan_restart_requested = False
+                self.start_async_scan()
 
     def files(self) -> list[IndexedFile]:
         with self._lock:
@@ -119,21 +134,36 @@ class FileIndexer(QObject):
 
     def stop(self) -> None:
         self._stopping = True
+        self._scan_restart_requested = False
+        self._watchdog_restart_requested = False
         if self._worker and self._worker.isRunning():
             self._worker.requestInterruption()
         if self._watchdog_worker and self._watchdog_worker.isRunning():
             self._watchdog_worker.requestInterruption()
         if self._observer:
-            try:
-                self._observer.stop()
-                self._observer.join(timeout=1)
-            except Exception:
-                pass
+            self._stop_observer_async(self._observer)
             self._observer = None
+
+    def resume(self) -> None:
+        self._stopping = False
+        if self._watchdog_worker and self._watchdog_worker.isRunning():
+            self._watchdog_restart_requested = True
+        if self._worker and self._worker.isRunning():
+            self._scan_restart_requested = True
+        else:
+            # Events during suspension were ignored; refresh the snapshot too.
+            self.start_async_scan()
+
+    def _stop_observer_async(self, observer) -> None:
+        worker = _ObserverStopWorker(observer)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     # ---- 内部 ----
 
     def _apply_snapshot(self, files: list[IndexedFile]) -> None:
+        if self._stopping:
+            return
         worker = self.sender()
         with self._lock:
             self._files = files
@@ -149,6 +179,8 @@ class FileIndexer(QObject):
         self._start_watchdog_async()
 
     def _start_watchdog_async(self) -> None:
+        if background_tasks_suspended():
+            return
         if self._observer or (self._watchdog_worker and self._watchdog_worker.isRunning()):
             return
         if self._stopping:
@@ -172,12 +204,9 @@ class FileIndexer(QObject):
     def _on_watchdog_started(self, observer) -> None:
         if observer is None:
             return
+        self.sender().claim_observer()
         if self._stopping:
-            try:
-                observer.stop()
-                observer.join(timeout=1)
-            except Exception:
-                pass
+            self._stop_observer_async(observer)
             return
         self._observer = observer
 
@@ -185,12 +214,17 @@ class FileIndexer(QObject):
         worker = self.sender()
         if worker is self._watchdog_worker:
             self._watchdog_worker = None
+            if self._watchdog_restart_requested and not self._stopping:
+                self._watchdog_restart_requested = False
+                self._start_watchdog_async()
 
     def _start_watchdog(self) -> None:
         """兼容旧调用方；实际启动始终异步。"""
         self._start_watchdog_async()
 
     def _on_fs_change(self, path: str, added: bool) -> None:
+        if self._stopping:
+            return
         try:
             p = Path(path).resolve()
         except OSError:
@@ -222,13 +256,38 @@ class FileIndexer(QObject):
                 self.file_removed.emit(key)
 
 
-class _WatchdogStartWorker(QThread):
+class _ObserverStopWorker(BackgroundThread):
+    def __init__(self, observer):
+        super().__init__()
+        self._observer = observer
+
+    def run(self) -> None:
+        try:
+            self._observer.stop()
+            self._observer.join()
+        except Exception:
+            perf_log.exception("watchdog 停止失败")
+
+
+class _WatchdogStartWorker(BackgroundThread):
     ready = Signal(object)
 
     def __init__(self, root: str, on_change: Callable[[str, bool], None], parent=None):
         super().__init__(parent)
         self._root = root
         self._on_change = on_change
+        self._unclaimed_observer = None
+        self.finished.connect(self._release_unclaimed_observer)
+
+    def claim_observer(self) -> None:
+        self._unclaimed_observer = None
+
+    def _release_unclaimed_observer(self) -> None:
+        if self._unclaimed_observer is not None:
+            worker = _ObserverStopWorker(self._unclaimed_observer)
+            self._unclaimed_observer = None
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
 
     def run(self) -> None:
         started = time.perf_counter()
@@ -269,24 +328,25 @@ class _WatchdogStartWorker(QThread):
             observer.start()
             if self.isInterruptionRequested():
                 observer.stop()
-                observer.join(timeout=1)
+                observer.join()
                 return
             perf_log.info(
                 "perf op=file-watchdog-start duration_ms=%.1f files=0 status=done",
                 (time.perf_counter() - started) * 1000,
             )
+            self._unclaimed_observer = observer
             self.ready.emit(observer)
         except Exception:
             perf_log.exception("watchdog 启动失败")
             if observer is not None:
                 try:
                     observer.stop()
-                    observer.join(timeout=1)
+                    observer.join()
                 except Exception:
                     pass
             self.ready.emit(None)
 
-class _IndexWorker(QThread):
+class _IndexWorker(BackgroundThread):
     done = Signal(list)
 
     def __init__(
@@ -352,7 +412,7 @@ class _IndexWorker(QThread):
         self.done.emit(files)
 
 
-class FileSearchWorker(QThread):
+class FileSearchWorker(BackgroundThread):
     """后台执行文件名模糊匹配；generation 用于丢弃过期结果。"""
 
     result = Signal(int, list, float)

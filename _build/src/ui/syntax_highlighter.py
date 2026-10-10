@@ -10,6 +10,8 @@ SQL/HTML/CSS/XML/Groovy/Gradle/Properties...）。
 """
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread, background_tasks_suspended
+
 import bisect
 import logging
 import time
@@ -250,8 +252,12 @@ def _build_block_token_index(text: str, lexer, should_stop) -> tuple[dict[int, l
         tokens = lexer.get_tokens_unprocessed(text)
         for start, token_type, token_text in tokens:
             token_count += 1
-            if token_count % 128 == 0 and should_stop():
-                return None
+            if token_count % 128 == 0:
+                if should_stop():
+                    return None
+                # Pygments' Python loop can starve Qt even in a QThread. Yield
+                # the GIL explicitly, as file-search workers already do.
+                time.sleep(0.001)
             if not token_text:
                 continue
             token_key = str(token_type)
@@ -275,7 +281,7 @@ def _build_block_token_index(text: str, lexer, should_stop) -> tuple[dict[int, l
     return formats, token_count
 
 
-class _TokenizeWorker(QThread):
+class _TokenizeWorker(BackgroundThread):
     done = Signal(int, object, int, float)  # generation, index, token count, duration
 
     def __init__(self, generation: int, text: str, lexer, parent=None):
@@ -328,6 +334,11 @@ class PygmentsHighlighter(QSyntaxHighlighter):
         self._applied_generation = 0
         self._last_tokenize_ms = 0.0
         self._last_apply_ms = 0.0
+        self._last_apply_total_ms = 0.0
+        self._pending_apply = None
+        self._apply_timer = QTimer(self)
+        self._apply_timer.setInterval(1)
+        self._apply_timer.timeout.connect(self._apply_highlight_batch)
         if lexer:
             self.retokenize()
 
@@ -335,6 +346,8 @@ class PygmentsHighlighter(QSyntaxHighlighter):
         if chars_removed == 0 and chars_added == 0:
             return   # contentsChange 偶发零变更触发，跳过
         self._generation += 1
+        self._apply_timer.stop()
+        self._pending_apply = None
         if self._worker and self._worker.isRunning():
             self._worker.requestInterruption()
         self._pending_request = None
@@ -352,6 +365,8 @@ class PygmentsHighlighter(QSyntaxHighlighter):
         """关闭预览时淘汰结果；线程由应用级生命周期统一等待。"""
         self._generation += 1
         self._pending_request = None
+        self._pending_apply = None
+        self._apply_timer.stop()
         if self._retokenize_timer.isActive():
             self._retokenize_timer.stop()
         if self._worker and self._worker.isRunning():
@@ -385,6 +400,8 @@ class PygmentsHighlighter(QSyntaxHighlighter):
         self._start_worker(*request)
 
     def _start_worker(self, generation: int, text: str, lexer) -> None:
+        if background_tasks_suspended():
+            return
         worker = _TokenizeWorker(
             generation, text, lexer, parent=QCoreApplication.instance(),
         )
@@ -408,26 +425,46 @@ class PygmentsHighlighter(QSyntaxHighlighter):
     ) -> None:
         if generation != self._generation or not isinstance(raw_index, dict):
             return
-        started = time.perf_counter()
-        formats: dict[str, QTextCharFormat] = {}
-        block_formats: dict[int, list[tuple[int, int, QTextCharFormat]]] = {}
-        for block, entries in raw_index.items():
+        self._block_formats = {}
+        self._last_apply_ms = 0.0
+        self._pending_apply = (
+            generation, raw_index, self.document().firstBlock(), token_count,
+            tokenize_ms, time.perf_counter(),
+        )
+        self._apply_timer.start()
+
+    def _apply_highlight_batch(self) -> None:
+        pending = self._pending_apply
+        if pending is None or pending[0] != self._generation:
+            self._pending_apply = None
+            self._apply_timer.stop()
+            return
+        generation, raw_index, block, token_count, tokenize_ms, started = pending
+        batch_started = time.perf_counter()
+        for _ in range(100):
+            if not block.isValid():
+                break
             converted = []
-            for offset, length, token_key in entries:
-                fmt = formats.get(token_key)
-                if fmt is None:
-                    fmt = formats[token_key] = _get_format(token_key)
-                converted.append((offset, length, fmt))
-            block_formats[block] = converted
-        self._block_formats = block_formats
-        self.rehighlight()
+            for offset, length, token_key in raw_index.get(block.blockNumber(), ()):
+                converted.append((offset, length, _get_format(token_key)))
+            self._block_formats[block.blockNumber()] = converted
+            self.rehighlightBlock(block)
+            block = block.next()
+            if time.perf_counter() - batch_started >= 0.008:
+                break
+        self._last_apply_ms = max(self._last_apply_ms, (time.perf_counter() - batch_started) * 1000)
+        if block.isValid():
+            self._pending_apply = (generation, raw_index, block, token_count, tokenize_ms, started)
+            return
+        self._pending_apply = None
+        self._apply_timer.stop()
         duration_ms = (time.perf_counter() - started) * 1000
         self._applied_generation = generation
         self._last_tokenize_ms = tokenize_ms
-        self._last_apply_ms = duration_ms
+        self._last_apply_total_ms = duration_ms
         perf_log.info(
-            "perf op=syntax-highlight-apply duration_ms=%.1f files=%d status=done",
-            duration_ms, token_count,
+            "perf op=syntax-highlight-apply duration_ms=%.1f batch_max_ms=%.1f files=%d status=done",
+            duration_ms, self._last_apply_ms, token_count,
         )
 
     def highlightBlock(self, text: str) -> None:

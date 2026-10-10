@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread
+
 import json
 import time
 from pathlib import Path
@@ -31,19 +33,13 @@ from src.core.target_resolver import (
     TargetResolutionError, resolve_target_path,
 )
 from src.util import app_log
+from src.core.app_version import build_info
 
 log = app_log.get_logger("cli_server")
 
 
 def _app_version() -> str:
-    """读取打包元信息里的版本号，失败时返回空串。"""
-    try:
-        import tomllib
-        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        return str(data.get("tool", {}).get("poetry", {}).get("version", ""))
-    except Exception:
-        return ""
+    return build_info()["version"]
 
 
 def _project_snapshot(tab) -> dict:
@@ -626,7 +622,7 @@ def _connect_async_worker(worker: QObject, responder: _GitDiffResponder) -> None
 
 
 def _run_git_diff_async(tab, mode: str, max_chars: int, sock: QLocalSocket) -> None:
-    thread = QThread()
+    thread = BackgroundThread()
     worker = _GitDiffWorker(tab.project_meta.path, mode, max_chars)
     responder = _GitDiffResponder(sock, thread, worker)
     worker.moveToThread(thread)
@@ -638,7 +634,7 @@ def _run_git_diff_async(tab, mode: str, max_chars: int, sock: QLocalSocket) -> N
 
 
 def _run_workspace_command_async(cmd: dict, window: "MainWindow", sock: QLocalSocket) -> None:
-    thread = QThread()
+    thread = BackgroundThread()
     running_paths = tuple(
         path
         for tab in _all_environment_tabs(window)
@@ -678,6 +674,12 @@ def handle_cli_request(data: str, sock: QLocalSocket, window: "MainWindow") -> b
 
     log.info("[CLI] %s params=%s", cmd.get("cmd", "?"), {k: v for k, v in cmd.items() if k != "cmd"})
 
+    if getattr(window, "_shutdown_in_progress", False) and cmd.get("cmd") not in (
+        "status", "preflight-build", "quit",
+    ):
+        _send_response(sock, {"ok": False, "error": "IDE is preparing to quit"})
+        return True
+
     try:
         result = _dispatch(cmd, window)
     except Exception as e:
@@ -700,7 +702,6 @@ def _send_response(sock: QLocalSocket, result: dict) -> None:
     payload = json.dumps(result, ensure_ascii=False) + "\n"
     sock.write(payload.encode("utf-8"))
     sock.flush()
-    sock.waitForBytesWritten(3000)
     sock.disconnectFromServer()
 
 
@@ -794,6 +795,14 @@ def handle_async_cli_request(
 ) -> bool:
     """处理需要异步等待的命令。返回 True 表示已接管。"""
     action = cmd.get("cmd")
+    if getattr(window, "_shutdown_in_progress", False) and action not in (
+        "status", "preflight-build", "quit",
+    ):
+        _send_response(sock, {"ok": False, "error": "IDE is preparing to quit"})
+        return True
+    if action == "quit":
+        _cmd_quit_async(window, sock)
+        return True
     if action in (
         "list-workspaces", "open-workspace", "create-development-workspace",
         "workspace-review", "workspace-commit-push", "workspace-sync",
@@ -801,10 +810,8 @@ def handle_async_cli_request(
     ):
         _run_workspace_command_async(cmd, window, sock)
         return True
-    if action in ("start", "restart") and not cmd.get("wait"):
-        return False
     if action not in (
-        "health", "compile", "ensure-running", "start", "restart",
+        "health", "compile", "ensure-running", "start", "stop", "restart",
         "git-diff", "git-ai-context",
     ):
         return False
@@ -828,10 +835,8 @@ def handle_async_cli_request(
     elif action == "ensure-running":
         _cmd_ensure_running_async(tab, cmd.get("module"), cmd.get("timeout", 60), sock)
         return True
-    elif action in ("start", "restart"):
-        _cmd_start_or_restart_wait_async(
-            tab, action, cmd.get("module"), cmd.get("timeout", 60), sock,
-        )
+    elif action in ("start", "stop", "restart"):
+        _cmd_service_async(tab, action, cmd.get("module"), cmd.get("timeout", 60), sock, bool(cmd.get("wait")))
         return True
     elif action in ("git-diff", "git-ai-context"):
         mode = cmd.get("mode", "summary")
@@ -991,6 +996,7 @@ def _cmd_status(window: "MainWindow") -> dict:
         "ok": True,
         "ide": "mini-ide",
         "version": _app_version(),
+        "build_time": build_info()["build_time"],
         "project_count": len(projects) + len(environments),
         "current_project": current_project,
         "active_workspace_name": active_workspace.name if active_workspace else "",
@@ -1106,66 +1112,26 @@ def _cmd_preflight_build(window: "MainWindow", project_key: str = "") -> dict:
     return {"ok": True, "can_build": True, "running": []}
 
 
-def _cmd_quit(window: "MainWindow") -> dict:
-    """停掉所有项目的所有服务，持久化会话后退出 mini-ide。
-
-    退出动作延迟到响应发回客户端之后执行（QTimer.singleShot），否则主进程
-    先退导致 CLI 端收不到确认、报「empty response」。
-    """
-    from src.ui.aggregate_project_tab import AggregateProjectTab
-    from src.ui.project_tab import ProjectTab
+def _cmd_quit_async(window: "MainWindow", sock: QLocalSocket) -> None:
     from PySide6.QtCore import QTimer
-    from PySide6.QtWidgets import QApplication
 
-    stopped_total = 0
-    projects = []
-    timed_out = []
-    for i in range(window.tabs.count()):
-        w = window.tabs.widget(i)
-        if not isinstance(w, (ProjectTab, AggregateProjectTab)):
-            continue
+    log.info("[CLI] quit: 开始保存文件与安全退出检查")
+
+    def complete(result: dict) -> None:
+        log.info("[CLI] quit %s", "ok" if result.get("ok") else result.get("error", "fail"))
         try:
-            running_items = w.running_service_items(refresh_external=True)
-            n, stopped = _stop_tab_all(w)
-        except Exception:
-            log.exception("停止项目服务失败: %s", w.project_meta.name)
-            n = 0
-            stopped = False
-        if n:
-            projects.append({
-                "name": w.project_meta.name,
-                "stopped": n,
-                "services": running_items,
-            })
-            stopped_total += n
-        if not stopped:
-            timed_out.append({
-                "name": w.project_meta.name,
-                "services": running_items,
-            })
+            if sock.state() == QLocalSocket.LocalSocketState.ConnectedState:
+                _send_response(sock, result)
+        except RuntimeError:
+            pass
+        if result.get("ok"):
+            QTimer.singleShot(300, window.finish_application_quit)
 
-    if timed_out:
-        log.warning("CLI quit：停止超时，取消退出；projects=%s", timed_out)
-        return {
-            "ok": False,
-            "error": "stop timeout",
-            "stopped": stopped_total,
-            "projects": projects,
-            "timed_out": timed_out,
-        }
+    window.prepare_application_quit(complete, stop_running=True, quiet=True)
 
-    # 持久化窗口几何 + Tab 会话，下次启动能恢复（与 closeEvent 行为一致）
-    try:
-        window._persist_geometry()
-        window._persist_tabs()
-        window.config.save()
-    except Exception:
-        log.exception("退出前持久化失败")
 
-    log.info("CLI quit：停止 %d 个服务，准备退出；projects=%s", stopped_total, projects)
-    # 延迟退出，确保响应已写回客户端
-    QTimer.singleShot(300, QApplication.quit)
-    return {"ok": True, "stopped": stopped_total, "projects": projects}
+def _cmd_quit(window: "MainWindow") -> dict:
+    return {"ok": False, "error": "quit command uses async handler"}
 
 
 def _cmd_list_projects(window: "MainWindow") -> list:
@@ -1438,34 +1404,36 @@ def _cmd_ensure_running_async(
     active = set(_active_modules(tab, module))
     already = all(name in active for name in targets)
     if not already:
-        start_result = _cmd_start(tab, module)
-        if start_result.get("ok") is False and start_result.get("error") != "already running":
-            _send_response(sock, start_result)
+        _cmd_service_async(tab, "start", module, timeout, sock, True, allow_already=True)
+        return
+    generations = tab.service_controller.snapshot_launch_generations(module)
+    _cmd_health_async(tab, module, timeout, sock, generations)
+
+
+def _cmd_service_async(tab, action, module, timeout, sock, wait=False, allow_already=False):
+    started_at = time.monotonic()
+    def completed(result):
+        try:
+            connected = sock.state() == QLocalSocket.LocalSocketState.ConnectedState
+        except RuntimeError:
             return
-    generations = tab.service_controller.snapshot_launch_generations(module)
-    _cmd_health_async(tab, module, timeout, sock, generations)
+        if not connected:
+            return
+        if not result.get("ok") and not (allow_already and result.get("error") == "already running"):
+            _send_response(sock, result)
+            return
+        if wait and action != "stop":
+            remaining = max(0, timeout - (time.monotonic() - started_at))
+            generations = tab.service_controller.snapshot_launch_generations(module)
+            _cmd_health_async(tab, module, remaining, sock, generations)
+        else:
+            _send_response(sock, result)
+    budget_ms = max(0, timeout) * 1000
+    tab.service_controller.request(action, module, completed, min(15000, budget_ms) if action == "stop" else budget_ms)
 
 
-def _cmd_start_or_restart_wait_async(
-    tab,
-    action: str,
-    module: str | None,
-    timeout: int,
-    sock: QLocalSocket,
-) -> None:
-    invalid = _validate_module(tab, module)
-    if invalid:
-        _send_response(sock, invalid)
-        return
-    if action == "restart":
-        result = _cmd_restart(tab, module)
-    else:
-        result = _cmd_start(tab, module)
-    if result.get("ok") is False and result.get("error") != "already running":
-        _send_response(sock, result)
-        return
-    generations = tab.service_controller.snapshot_launch_generations(module)
-    _cmd_health_async(tab, module, timeout, sock, generations)
+def _cmd_start_or_restart_wait_async(tab, action, module, timeout, sock):
+    _cmd_service_async(tab, action, module, timeout, sock, True, allow_already=True)
 
 
 def _cmd_compile_async(tab, sock: QLocalSocket, timeout: int = 300) -> None:

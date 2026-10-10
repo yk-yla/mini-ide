@@ -5,6 +5,8 @@ checkout / merge+push 走独立 worker 避免冻 UI。
 """
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread
+
 import logging
 import time
 
@@ -14,7 +16,7 @@ from PySide6.QtCore import QThread, Signal
 perf_log = logging.getLogger("mini-ide.performance")
 
 
-class GitFetchWorker(QThread):
+class GitFetchWorker(BackgroundThread):
     """git fetch 后台执行（不改本地）。done(ok)"""
 
     done = Signal(bool)
@@ -33,7 +35,7 @@ class GitFetchWorker(QThread):
         self.done.emit(ok)
 
 
-class GitBranchListWorker(QThread):
+class GitBranchListWorker(BackgroundThread):
     """后台读取分支列表，避免打开分支菜单时同步启动多个 Git 子进程。"""
 
     done = Signal(dict)
@@ -54,7 +56,7 @@ class GitBranchListWorker(QThread):
         self.done.emit(data)
 
 
-class GitDirtyCheckWorker(QThread):
+class GitDirtyCheckWorker(BackgroundThread):
     """后台检查工作区是否有未提交改动。"""
 
     done = Signal(bool)
@@ -75,7 +77,7 @@ class GitDirtyCheckWorker(QThread):
         self.done.emit(dirty)
 
 
-class GitCheckoutWorker(QThread):
+class GitCheckoutWorker(BackgroundThread):
     """后台切换分支。done(ok, error_msg)"""
 
     done = Signal(bool, str)
@@ -91,7 +93,7 @@ class GitCheckoutWorker(QThread):
         self.done.emit(ok, msg)
 
 
-class GitCheckoutRemoteWorker(QThread):
+class GitCheckoutRemoteWorker(BackgroundThread):
     """后台切到远程分支。done(ok, error_msg)"""
 
     done = Signal(bool, str)
@@ -107,7 +109,7 @@ class GitCheckoutRemoteWorker(QThread):
         self.done.emit(ok, msg)
 
 
-class GitDeleteLocalBranchWorker(QThread):
+class GitDeleteLocalBranchWorker(BackgroundThread):
     """后台安全删除本地分支。done(ok, msg)"""
 
     done = Signal(bool, str)
@@ -123,7 +125,7 @@ class GitDeleteLocalBranchWorker(QThread):
         self.done.emit(ok, msg)
 
 
-class GitMergePushWorker(QThread):
+class GitMergePushWorker(BackgroundThread):
     """后台执行 fetch + merge 远程分支 + push。done(ok, msg)"""
 
     done = Signal(bool, str)
@@ -139,7 +141,7 @@ class GitMergePushWorker(QThread):
         self.done.emit(ok, msg)
 
 
-class GitStatusWorker(QThread):
+class GitStatusWorker(BackgroundThread):
     """后台拉 git status / ignored / deleted + 分支信息，给文件树染色和状态栏用。
 
     主线程跑这些命令在大仓库上 200ms~1s+，每 3s 跑一次会让目录树滚动很卡。

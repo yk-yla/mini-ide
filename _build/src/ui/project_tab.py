@@ -190,6 +190,8 @@ class ProjectTab(QWidget):
         # 这些模块面板显示「运行中(外部)」，停止按钮走 kill_pid 而非 runner.stop()。
         self._module_external_pids: dict[str, int] = {}
         self._runtime_start_generation = 0
+        self._runtime_start_pending = False
+        self._runtime_start_error = ""
         self._nginx_status = None
         # 外部进程感知器：构造时一次性预算各模块的 match keys（模块列表不变），
         # 之后每轮刷新只做匹配。从 ProjectTab 抽到 core.external_detector 便于单测。
@@ -291,11 +293,11 @@ class ProjectTab(QWidget):
                 parent=self,
                 title=unit_title,
             )
-            self.service_panel.startRequested.connect(self._start_module)
-            self.service_panel.stopRequested.connect(self._stop_module)
+            self.service_panel.startRequested.connect(lambda module: self.service_controller.request_gui("start", module))
+            self.service_panel.stopRequested.connect(lambda module: self.service_controller.request_gui("stop", module))
             self.service_panel.focusRequested.connect(self._focus_module_log)
-            self.service_panel.startAllRequested.connect(self._start_all_modules)
-            self.service_panel.stopAllRequested.connect(self._stop_all_modules)
+            self.service_panel.startAllRequested.connect(lambda: self.service_controller.request_gui("start"))
+            self.service_panel.stopAllRequested.connect(lambda: self.service_controller.request_gui("stop"))
             self.service_panel.clearLogsRequested.connect(self.clear_all_logs)
             left_wrap.addWidget(self.service_panel)
             left_wrap.addWidget(self.file_tree)
@@ -435,6 +437,10 @@ class ProjectTab(QWidget):
     # ---- 动作 ----
 
     def _run_profile(self, prof: RunProfile) -> None:
+        conflict = self.service_controller.operation_error()
+        if conflict:
+            self.log.append_line("stderr", f"[操作已阻止] {conflict['error']}")
+            return
         if self.service_controller.runner_busy(self.runner):
             ret = QMessageBox.question(
                 self, "已有任务在运行",
@@ -518,17 +524,11 @@ class ProjectTab(QWidget):
         return False
 
     def _on_main_clicked(self) -> None:
-        """主按钮点击：根据当前状态决定启动 or 停止"""
         if self.project_meta.project_type == "nginx":
-            status = self._detect_nginx_status()
-            if status.running or self.service_controller.runner_busy(self.runner):
-                self._stop_nginx_external()
-            else:
-                self._start_nginx()
-            self._refresh_status_row()
-            return
-        if self.service_controller.runner_busy(self.runner):
-            self._stop()
+            active = self._detect_nginx_status().running or self.service_controller.runner_busy(self.runner)
+            self.service_controller.request_gui("stop" if active else "start")
+        elif self.service_controller.runner_busy(self.runner):
+            self.service_controller.request_gui("stop")
         elif self._primary_profile:
             self._run_profile(self._primary_profile)
 
@@ -564,15 +564,7 @@ class ProjectTab(QWidget):
 
     def _restart(self) -> None:
         action_log.info("[GUI] 重启服务 project=%s", self.project_meta.name)
-        primary = next((p for p in self.project_meta.profiles if p.primary), None)
-        if not primary:
-            return
-        if self.service_controller.runner_busy(self.runner):
-            # 同 _run_profile：事件驱动，停止完成后由 _on_finished 接力启动
-            self._pending_restart = primary
-            self._stop()
-        else:
-            self._run_profile(primary)
+        self.service_controller.request_gui("restart")
 
     # ---- 多运行单元动作 ----
 
@@ -702,25 +694,9 @@ class ProjectTab(QWidget):
         重启时若不先停掉它，新进程会撞端口/gradle 冲突，瞬间以错误码退出，结果旧的
         没停、新的没起，界面继续挂着外部标记。
         """
-        from src.core.process_runner import kill_pid, is_port_listening
-        port = self._module_ports.get(module)
-        pid = self._module_external_pids.pop(module, None)
-        if pid:
-            kill_pid(pid)
-        # 等端口真正释放（最多 ~8s）。用实时直查而非后台快照：kill 后快照会被清空，
-        # 依赖它会被「清空 = 已释放」骗到。期间 processEvents 让 UI 不至于完全冻结。
-        if port:
-            import time
-            from PySide6.QtCore import QCoreApplication, QEventLoop
-            deadline = time.time() + 8.0
-            while time.time() < deadline:
-                if not is_port_listening(port):
-                    return True
-                QCoreApplication.processEvents(
-                    QEventLoop.ProcessEventsFlag.AllEvents, 100
-                )
-            return not is_port_listening(port)
-        return True
+        # 接管由 controller 的异步 stop→start 完成，原语不得嵌套等待。
+        self.log.append_line("stderr", f"[启动已阻止] {module} 仍在外部运行，请先停止")
+        return False
 
 
     def _stop_module(self, module: str, silent: bool = False) -> bool:
@@ -750,19 +726,9 @@ class ProjectTab(QWidget):
                 )
                 if ret != QMessageBox.StandardButton.Yes:
                     return False
-            from src.core.process_runner import kill_pid
             if self.service_panel:
                 self.service_panel.update_state(module, STATE_STOPPING)
-            ok = kill_pid(pid)
-            if ok:
-                self._module_external_pids.pop(module, None)
-                if self.service_panel:
-                    self.service_panel.update_state(module, STATE_IDLE)
-            else:
-                self.log.append_line("stderr", f"[停止失败] 无法结束 {module} (PID {pid})")
-                # 刷新会重新感知真实状态
-                self._refresh_status_row()
-            return ok
+            return self.service_controller.stop_external(module, pid)
         return False
 
     def _start_runtime_stop(
@@ -904,6 +870,8 @@ class ProjectTab(QWidget):
         if not groups:
             return False
         self._runtime_start_generation += 1
+        self._runtime_start_pending = True
+        self._runtime_start_error = ""
         return self._start_runtime_group(
             groups, 0, silent=silent, generation=self._runtime_start_generation,
         )
@@ -923,9 +891,12 @@ class ProjectTab(QWidget):
                 continue
             all_ok = self._start_module(unit.id, silent=silent) and all_ok
         if not all_ok:
+            self._runtime_start_pending = False
+            self._runtime_start_error = "failed to start runtime dependency group"
             self.log.append_line("stderr", "[启动中止] 当前依赖组存在启动失败项")
             return False
         if index + 1 >= len(groups):
+            self._runtime_start_pending = False
             return True
         launch_generations = self.service_controller.snapshot_launch_generations(None)
         deadline = time.time() + 90.0
@@ -954,6 +925,8 @@ class ProjectTab(QWidget):
             ):
                 ok = True
             if not ok and detail.get("error"):
+                self._runtime_start_pending = False
+                self._runtime_start_error = detail["error"]
                 self.log.append_line(
                     "stderr", f"[依赖启动失败] {unit.id}: {detail['error']}",
                 )
@@ -961,11 +934,15 @@ class ProjectTab(QWidget):
             if not ok:
                 pending.append(unit.id)
         if not pending:
-            self._start_runtime_group(
-                groups, index + 1, silent=silent, generation=generation,
-            )
+            self.service_controller._operation_invoking = True
+            try:
+                self._start_runtime_group(groups, index + 1, silent=silent, generation=generation)
+            finally:
+                self.service_controller._operation_invoking = False
             return
         if time.time() >= deadline:
+            self._runtime_start_pending = False
+            self._runtime_start_error = "runtime dependency startup timeout"
             self.log.append_line(
                 "stderr", f"[依赖启动超时] 等待就绪：{', '.join(pending)}",
             )
@@ -988,6 +965,7 @@ class ProjectTab(QWidget):
         """
         from src.core.process_runner import kill_pid
         self._runtime_start_generation += 1
+        self._runtime_start_pending = False
 
         # 反向依赖顺序停止，避免先停依赖再停调用方。
         from src.core.runtime_units import runtime_start_groups
@@ -1034,11 +1012,8 @@ class ProjectTab(QWidget):
         for module, pid in external.items():
             if self.service_panel:
                 self.service_panel.update_state(module, STATE_STOPPING)
-            if kill_pid(pid):
-                self._module_external_pids.pop(module, None)
+            if self.service_controller.stop_external(module, pid):
                 stopped += 1
-                if self.service_panel:
-                    self.service_panel.update_state(module, STATE_IDLE)
             else:
                 self.log.append_line("stderr", f"[停止失败] 无法结束 {module} (PID {pid})")
         # 刷新一次，把真实状态同步回面板
@@ -1115,6 +1090,7 @@ class ProjectTab(QWidget):
         if self.service_panel:
             mapping = {
                 "idle":     STATE_IDLE,
+                "starting": STATE_STARTING,
                 "running":  STATE_RUNNING,
                 "stopping": STATE_STOPPING,
             }
@@ -1685,28 +1661,11 @@ class ProjectTab(QWidget):
         return self._nginx_status
 
     def _stop_nginx_external(self) -> bool:
-        from src.core.process_runner import kill_pid
-        from pathlib import Path
-        import time
         status = self._nginx_status or self._detect_nginx_status()
         pid = status.master_pid if status and status.running else None
         if not pid:
             return False
-        ok = kill_pid(pid)
-        if ok:
-            self._nginx_status = None
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
-                if not self._detect_nginx_status().running:
-                    pid_file = Path(self.project_meta.path) / "running.pid"
-                    try:
-                        pid_file.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    return True
-                QApplication.processEvents()
-                time.sleep(0.2)
-        return False
+        return self.service_controller.stop_external("__nginx__", pid)
 
     def _start_nginx(self) -> bool:
         if self.project_meta.project_type != "nginx":
@@ -1745,11 +1704,15 @@ class ProjectTab(QWidget):
                 self._module_external_pids.pop(mod_name, None)
 
     def _start_status_polling(self) -> None:
+        if QApplication.instance().property("mini_ide_shutting_down"):
+            return
         if self.isVisible():
             self._refresh_status_row()
         self._poll_timer.start()
 
     def _poll_status_if_visible(self) -> None:
+        if QApplication.instance().property("mini_ide_shutting_down"):
+            return
         if not self.isVisible():
             return
         started = time.perf_counter()
@@ -1762,6 +1725,8 @@ class ProjectTab(QWidget):
             )
 
     def _start_fetch_polling(self) -> None:
+        if QApplication.instance().property("mini_ide_shutting_down"):
+            return
         if not self._is_git_repo:
             return
         self._start_remote_fetch()
@@ -2452,22 +2417,7 @@ class ProjectTab(QWidget):
         if not ok:
             self._show_preview(path, 0, 0)
 
-    def request_close(
-        self,
-        confirm_running: bool = True,
-        stop_running: bool = True,
-        quiet: bool = False,
-    ) -> bool:
-        running_items = self.running_service_items(refresh_external=True)
-        any_running = bool(running_items)
-        if any_running and confirm_running:
-            ret = QMessageBox.question(
-                self, "项目正在运行",
-                f"{self.project_meta.name} 正在运行，关闭会停止所有进程。确认关闭？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
-                return False
+    def flush_pending_saves(self, quiet: bool = False) -> bool:
         # 关闭前强制把所有 pending 自动保存刷盘。保存失败时保留项目，
         # 避免 tab 被关掉后用户误以为改动已经落盘。
         failed_panes = []
@@ -2486,8 +2436,63 @@ class ProjectTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "保存失败",
-                    f"有 {len(failed_panes)} 个文件未能保存，已取消关闭项目。",
+                    f"有 {len(failed_panes)} 个文件未能保存，已取消关闭或退出。",
                 )
+            return False
+        return True
+
+    def suspend_background_tasks(self) -> tuple[bool, bool]:
+        polling = (self._poll_timer.isActive() or self._poll_start_timer.isActive(),
+                   self._fetch_timer.isActive() or self._fetch_start_timer.isActive())
+        self._poll_timer.stop()
+        self._fetch_timer.stop()
+        self._poll_start_timer.stop()
+        self._fetch_start_timer.stop()
+        for pane in self._file_panes.values():
+            pane.stop_workers()
+        self.indexer.stop()
+        if self._controller_indexer is not None:
+            self._controller_indexer.stop()
+        self.file_tree.stop_workers()
+        return polling
+
+    def resume_background_tasks(self, polling: tuple[bool, bool]) -> None:
+        self.indexer.resume()
+        self.file_tree._directory_loading.clear()
+        self.file_tree._reload()
+        if self._controller_indexer is not None and not self._controller_indexer.is_built():
+            self._controller_indexer.build_async()
+        if polling[0]:
+            self._poll_timer.start()
+        if polling[1]:
+            self._fetch_timer.start()
+        for pane in self._file_panes.values():
+            pane._search_stopped = False
+            pane._schedule_search_status()
+            if pane._highlighter is not None:
+                pane._highlighter.retokenize()
+
+    def request_close(
+        self,
+        confirm_running: bool = True,
+        stop_running: bool = True,
+        quiet: bool = False,
+    ) -> bool:
+        if self.service_controller.operation_error():
+            if not quiet:
+                QMessageBox.information(self, "操作进行中", "服务启停尚未完成，请完成后再关闭项目。")
+            return False
+        running_items = self.running_service_items(refresh_external=True)
+        any_running = bool(running_items)
+        if any_running and confirm_running:
+            ret = QMessageBox.question(
+                self, "项目正在运行",
+                f"{self.project_meta.name} 正在运行，关闭会停止所有进程。确认关闭？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return False
+        if not self.flush_pending_saves(quiet):
             return False
         if any_running and stop_running:
             self.stop_all_services(include_external=True, silent=True)
@@ -2506,6 +2511,8 @@ class ProjectTab(QWidget):
         for pane in self._file_panes.values():
             pane.stop_workers()
         self.indexer.stop()
+        if self._controller_indexer is not None:
+            self._controller_indexer.stop()
         self.file_tree.stop_workers()
         # Git 子进程可能受磁盘或网络影响。关闭 Tab 时把 worker 转交给应用回收，
         # 不在 UI 线程逐个 wait；接收者销毁后 Qt 会自动断开结果信号。

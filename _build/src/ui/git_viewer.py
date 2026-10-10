@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread
+
 import logging
 import time
 from pathlib import Path
@@ -24,6 +26,25 @@ from src.ui.theme import (
 from src.util.editor import REVEAL_LABEL, reveal_in_explorer
 
 perf_log = logging.getLogger("mini-ide.performance")
+DIFF_PREVIEW_CHARS = 200_000
+DIFF_PREVIEW_LINES = 2_000
+DIFF_PREVIEW_LINE_CHARS = 4_000
+
+
+def _bounded_diff_preview(text: str) -> str:
+    truncated = len(text) > DIFF_PREVIEW_CHARS
+    sample = text[:DIFF_PREVIEW_CHARS]
+    lines = sample.splitlines()
+    truncated = truncated or len(lines) > DIFF_PREVIEW_LINES
+    out = []
+    for line in lines[:DIFF_PREVIEW_LINES]:
+        if len(line) > DIFF_PREVIEW_LINE_CHARS:
+            truncated = True
+            line = line[:DIFF_PREVIEW_LINE_CHARS] + " …"
+        out.append(line)
+    if truncated:
+        out.append("\n…（仅显示前部 diff，复制也仅包含预览；完整内容请使用 Git CLI）")
+    return "\n".join(out)
 
 
 def _overview_signature(
@@ -41,7 +62,7 @@ def _overview_signature(
     return "\n".join(parts)
 
 
-class _OverviewWorker(QThread):
+class _OverviewWorker(BackgroundThread):
     done = Signal(str, str, list, dict, str)  # root, branch, files, numstat, signature
 
     def __init__(self, root: str, parent=None):
@@ -62,7 +83,7 @@ class _OverviewWorker(QThread):
         self.done.emit(root, branch, files, stats, signature)
 
 
-class _FileDiffWorker(QThread):
+class _FileDiffWorker(BackgroundThread):
     done = Signal(str, str)  # path, diff text
 
     def __init__(self, root: str, changed_file: git_ops.ChangedFile, parent=None):
@@ -74,6 +95,9 @@ class _FileDiffWorker(QThread):
         started = time.perf_counter()
         f = self.changed_file
         text = git_context.file_diff_text(self.root, f)
+        if self.isInterruptionRequested():
+            return
+        text = _bounded_diff_preview(text)
         perf_log.info(
             "perf op=git-diff-worker duration_ms=%.1f files=1 status=done",
             (time.perf_counter() - started) * 1000,
@@ -130,6 +154,7 @@ class GitViewer(QDialog):
         self.resize(1120, 720)
         self._overview_worker: _OverviewWorker | None = None
         self._diff_worker: _FileDiffWorker | None = None
+        self._pending_diff = None
         self._numstat: dict[str, tuple[int, int]] = {}
         self._last_signature = ""
         self._selected_path = ""
@@ -203,8 +228,9 @@ class GitViewer(QDialog):
             changed = item.data(Qt.ItemDataRole.UserRole)
             if changed is not None:
                 item.setForeground(QColor(str(self._status_color(changed))))
+        self.diff_highlighter.setDocument(None)
+        self.diff_highlighter.deleteLater()
         self.diff_highlighter = DiffHighlighter(self.diff_view.document())
-        self.diff_highlighter.rehighlight()
 
     def _status_label(self, f: git_ops.ChangedFile) -> str:
         return git_context.status_label(f)
@@ -273,14 +299,28 @@ class GitViewer(QDialog):
         if self._closing:
             return
         if not current:
+            self._pending_diff = None
+            if self._diff_worker is not None:
+                self._diff_worker.requestInterruption()
             self.diff_view.setPlainText("")
             return
         f: git_ops.ChangedFile = current.data(Qt.ItemDataRole.UserRole)
         self._selected_path = f.path
         self.diff_view.setPlainText("正在加载 diff...")
+        self._pending_diff = f
+        if self._diff_worker is not None:
+            self._diff_worker.requestInterruption()
+            return
+        self._start_pending_diff()
+
+    def _start_pending_diff(self) -> None:
+        if self._closing or self._pending_diff is None:
+            return
+        f, self._pending_diff = self._pending_diff, None
         worker = _FileDiffWorker(self.root, f, parent=QApplication.instance())
         self._diff_worker = worker
         worker.done.connect(self._on_file_diff_loaded)
+        worker.finished.connect(self._on_diff_finished)
         self._track_worker(worker)
         worker.start()
 
@@ -289,12 +329,16 @@ class GitViewer(QDialog):
             return
         if self.sender() is not self._diff_worker:
             return
+        if self._diff_worker.isInterruptionRequested():
+            return
         current = self.changes_list.currentItem()
         if current:
             f: git_ops.ChangedFile = current.data(Qt.ItemDataRole.UserRole)
             if f.path == path:
                 self.diff_view.setPlainText(text)
+    def _on_diff_finished(self) -> None:
         self._diff_worker = None
+        self._start_pending_diff()
 
     def _on_changes_context_menu(self, pos) -> None:
         item = self.changes_list.itemAt(pos)

@@ -1,6 +1,8 @@
 """聚合目录工作台：一个顶层 Tab 管理自己的项目和需求工作区。"""
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread
+
 import logging
 import subprocess
 import time
@@ -46,7 +48,7 @@ from src.ui.theme import (
 action_log = logging.getLogger("mini-ide.action")
 
 
-class _PrepareProjectsWorker(QThread):
+class _PrepareProjectsWorker(BackgroundThread):
     done = Signal(object, int)
 
     def __init__(self, items: tuple[dict, ...], generation: int, parent=None):
@@ -70,7 +72,7 @@ class _PrepareProjectsWorker(QThread):
         self.done.emit(results, self.generation)
 
 
-class _SaveProjectWorker(QThread):
+class _SaveProjectWorker(BackgroundThread):
     done = Signal(bool, str)
 
     def __init__(self, project: AggregateProject, parent=None):
@@ -84,7 +86,7 @@ class _SaveProjectWorker(QThread):
             self.done.emit(False, str(exc))
 
 
-class _WorkspaceSnapshotWorker(QThread):
+class _WorkspaceSnapshotWorker(BackgroundThread):
     done = Signal(object, str)
 
     def __init__(self, aggregate_path: str, parent=None):
@@ -99,7 +101,7 @@ class _WorkspaceSnapshotWorker(QThread):
             self.done.emit((), str(exc))
 
 
-class _CreateWorkspaceWorker(QThread):
+class _CreateWorkspaceWorker(BackgroundThread):
     done = Signal(object)
 
     def __init__(self, plan, parent=None):
@@ -110,7 +112,7 @@ class _CreateWorkspaceWorker(QThread):
         self.done.emit(create_development_workspace(self.plan))
 
 
-class _MergeWorkspaceWorker(QThread):
+class _MergeWorkspaceWorker(BackgroundThread):
     done = Signal(object, str)
 
     def __init__(self, workspace: DevelopmentWorkspace, parent=None):
@@ -124,7 +126,7 @@ class _MergeWorkspaceWorker(QThread):
             self.done.emit(None, str(exc))
 
 
-class _SyncPushWorkspaceWorker(QThread):
+class _SyncPushWorkspaceWorker(BackgroundThread):
     done = Signal(object, str)
 
     def __init__(
@@ -154,7 +156,7 @@ class _SyncPushWorkspaceWorker(QThread):
             self.done.emit(None, str(exc))
 
 
-class _DeletePreflightWorker(QThread):
+class _DeletePreflightWorker(BackgroundThread):
     done = Signal(object, str)
 
     def __init__(
@@ -173,7 +175,7 @@ class _DeletePreflightWorker(QThread):
             self.done.emit(None, str(exc))
 
 
-class _DeleteWorkspaceWorker(QThread):
+class _DeleteWorkspaceWorker(BackgroundThread):
     done = Signal(bool, object, str)
 
     def __init__(self, plan, confirm_unmerged: bool, parent=None):
@@ -1379,7 +1381,7 @@ class AggregateProjectTab(QWidget):
         states = [item for item in tab.service_states(refresh_external=True) if item.kind != "script"]
         if states and all(item.is_running for item in states):
             return {"ok": True, "already_running": True}
-        result = tab.service_controller.start()
+        result = tab.service_controller.request("start", on_done=lambda _result: self.refresh_project_states())
         self.refresh_project_states()
         return result
 
@@ -1389,7 +1391,7 @@ class AggregateProjectTab(QWidget):
         tab = self._project_tabs.get(component_id)
         if tab is None:
             return {"ok": False, "error": f"project not available: {component_id}"}
-        result = tab.service_controller.start(runtime_id)
+        result = tab.service_controller.request("start", runtime_id, lambda _result: self.refresh_project_states())
         self.refresh_project_states()
         return result
 
@@ -1399,7 +1401,7 @@ class AggregateProjectTab(QWidget):
             return {"ok": False, "error": f"project not available: {component_id}"}
         if not tab.running_service_items(refresh_external=True):
             return {"ok": True, "already_stopped": True}
-        result = tab.service_controller.stop()
+        result = tab.service_controller.request("stop", on_done=lambda _result: self.refresh_project_states())
         self.refresh_project_states()
         return result
 
@@ -1412,7 +1414,7 @@ class AggregateProjectTab(QWidget):
         states = tab.service_states(refresh_external=True)
         if not any(item.module == runtime_id and item.is_active for item in states):
             return {"ok": True, "already_stopped": True}
-        result = tab.service_controller.stop(runtime_id)
+        result = tab.service_controller.request("stop", runtime_id, lambda _result: self.refresh_project_states())
         self.refresh_project_states()
         return result
 
@@ -1485,6 +1487,16 @@ class AggregateProjectTab(QWidget):
     def request_close(
         self, confirm_running: bool = True, stop_running: bool = True, quiet: bool = False,
     ) -> bool:
+        # Writes must finish before their workbench is closed. Queries can finish
+        # under the application owner without blocking the GUI.
+        for worker in (
+            self._save_worker, self._create_worker, self._merge_worker,
+            self._sync_push_worker, self._delete_worker,
+        ):
+            if worker and worker.isRunning():
+                if not quiet:
+                    QMessageBox.information(self, "任务进行中", "工作区正在写入或同步，请完成后再关闭。")
+                return False
         running = self.running_service_items(refresh_external=True)
         if running and confirm_running:
             result = QMessageBox.question(
@@ -1502,13 +1514,9 @@ class AggregateProjectTab(QWidget):
             ):
                 return False
         self._refresh_timer.stop()
-        for worker in (
-            self._prepare_worker, self._save_worker, self._workspace_worker,
-            self._create_worker, self._merge_worker, self._sync_push_worker,
-            self._delete_preflight_worker, self._delete_worker,
-        ):
+        for worker in (self._prepare_worker, self._workspace_worker, self._delete_preflight_worker):
             if worker and worker.isRunning():
-                worker.wait(3000)
+                worker.requestInterruption()
         return True
 
     def _current_project_tab(self) -> ProjectTab | None:

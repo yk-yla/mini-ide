@@ -1197,9 +1197,22 @@ def inspect_workspace_delete(
     for item in workspace.components:
         if item.mode != "worktree":
             continue
+        task_ref = item.task_branch
+        exists, _out, _err = _run_git(
+            item.source_repository_path,
+            ["show-ref", "--verify", "--quiet", f"refs/heads/{task_ref}"], 10,
+        )
+        if exists == 1:
+            # A previous deletion may have removed branches while retaining an
+            # occupied directory. Verify its detached HEAD so deletion is retryable.
+            code, branch, _err = _run_git(item.worktree_path, ["symbolic-ref", "--quiet", "HEAD"], 10)
+            if code == 1 and not branch:
+                code, commit, _err = _run_git(item.worktree_path, ["rev-parse", "--verify", "HEAD"], 10)
+                if code == 0:
+                    task_ref = commit
         merged_code, _out, merged_err = _run_git(
             item.source_repository_path,
-            ["merge-base", "--is-ancestor", item.task_branch, item.base_branch], 15,
+            ["merge-base", "--is-ancestor", task_ref, item.base_branch], 15,
         )
         merged = merged_code == 0
         base_remote_ref, base_error = _workspace_base_remote_ref(item, fetched)
@@ -1297,6 +1310,41 @@ def _workspace_delete_root_error(workspace: DevelopmentWorkspace) -> str:
     return ""
 
 
+def _workspace_delete_occupancy_error(root: Path) -> str:
+    """Probe delete access before removing anything; never follow reparse points."""
+    if os.name != "nt" or not root.exists():
+        return ""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create.restype = wintypes.HANDLE
+    close = kernel.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    pending = [root]
+    try:
+        while pending:
+            path = pending.pop()
+            handle = create(str(path), 0x00010000, 0x7, None, 3,
+                            0x02000000 | 0x00200000, None)
+            if handle == ctypes.c_void_p(-1).value:
+                error = ctypes.get_last_error()
+                reason = "被其他程序占用" if error in (32, 33) else "没有删除权限或无法检查"
+                return f"工作区{reason}，已保留目录内容：{path}（Windows 错误 {error}）"
+            close(handle)
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode) and not (info.st_file_attributes & 0x400):
+                with os.scandir(path) as entries:
+                    pending.extend(Path(entry.path) for entry in entries)
+    except OSError as exc:
+        return f"工作区占用检查失败，已保留目录内容：{exc}"
+    return ""
+
+
 def _delete_remote_task_branches(
     item: WorkspaceComponent,
     base_remote_ref: str,
@@ -1353,6 +1401,9 @@ def delete_development_workspace(
     try:
         root = canonical_path(fresh_plan.workspace.root_path)
         errors: list[str] = []
+        directory_error = _workspace_delete_occupancy_error(root)
+        if directory_error:
+            errors.append(directory_error)
         # Detach each owned Worktree before removing files. Git otherwise refuses
         # to delete its checked-out branch when an occupied directory survives.
         for item in fresh_plan.workspace.components:
@@ -1372,9 +1423,8 @@ def delete_development_workspace(
                     )
                 if code != 0:
                     errors.append(f"{item.id} 解除目录与分支的关联失败：{err}")
-        directory_error = ""
         try:
-            if root.exists():
+            if not directory_error and root.exists():
                 shutil.rmtree(root, onerror=_remove_readonly_path)
         except OSError as exc:
             directory_error = f"工作区目录未删完：{root}；{exc}"

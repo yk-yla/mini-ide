@@ -9,6 +9,10 @@ cd /d "%~dp0\.."
 set "BUILD_DIR=%CD%"
 set "VENV_DIR=%BUILD_DIR%\.venv"
 set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
+set "PACKAGE_ONLY=0"
+if /i "%~1"=="--package-only" set "PACKAGE_ONLY=1"
+if not "%~1"=="" if not "%PACKAGE_ONLY%"=="1" goto :bad_args
+if not "%~2"=="" goto :bad_args
 
 rem ---------- 1. Locate system Python ----------
 set "SYS_PY="
@@ -48,6 +52,10 @@ if exist dist rmdir /s /q dist
 if exist mini-ide.spec del /q mini-ide.spec
 if exist mini-ide-cli.spec del /q mini-ide-cli.spec
 
+rem Prepare candidate metadata without consuming a version on failure.
+"%VENV_PY%" scripts\release_version.py prepare --root "%BUILD_DIR%" --output "pyinstaller-work\release-version"
+if errorlevel 1 goto :fail_version
+
 rem ---------- 6. Build ----------
 echo [build] Running PyInstaller ...
 rem Keep PyInstaller's DLL discovery away from project JDK/Node/etc. PATH entries.
@@ -62,6 +70,8 @@ set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%SystemR
     --windowed ^
     --contents-directory mini-ide-runtime ^
     --icon src\resources\icon.ico ^
+    --version-file "pyinstaller-work\release-version\mini-ide.exe.version.txt" ^
+    --add-data "pyinstaller-work\release-version\version.json;." ^
     --add-data "src;src" ^
     --hidden-import psutil ^
     --hidden-import watchdog ^
@@ -83,6 +93,8 @@ echo [build] Running PyInstaller for console CLI ...
     --console ^
     --contents-directory mini-ide-runtime ^
     --icon src\resources\icon.ico ^
+    --version-file "pyinstaller-work\release-version\mini-ide-cli.exe.version.txt" ^
+    --add-data "pyinstaller-work\release-version\version.json;." ^
     --hidden-import psutil ^
     --distpath dist ^
     --workpath pyinstaller-work ^
@@ -99,6 +111,18 @@ if not errorlevel 1 goto :fail_bad_dll_source
 findstr /i /c:"\\jdk" "pyinstaller-work\mini-ide-cli\Analysis-00.toc" >nul 2>nul
 if not errorlevel 1 goto :fail_bad_dll_source
 
+rem Assemble one complete portable directory, including matching GUI/CLI metadata.
+mkdir "dist\release"
+copy /y "dist\mini-ide\mini-ide.exe" "dist\release\mini-ide.exe" >nul
+if errorlevel 1 goto :fail_build
+copy /y "dist\mini-ide-cli\mini-ide-cli.exe" "dist\release\mini-ide-cli.exe" >nul
+if errorlevel 1 goto :fail_build
+xcopy /e /i /y "dist\mini-ide\mini-ide-runtime" "dist\release\mini-ide-runtime" >nul
+if errorlevel 1 goto :fail_build
+xcopy /e /i /y "dist\mini-ide-cli\mini-ide-runtime" "dist\release\mini-ide-runtime" >nul
+if errorlevel 1 goto :fail_build
+if "%PACKAGE_ONLY%"=="1" goto :commit_version
+
 echo [build] Publishing mini-ide.exe and mini-ide-cli.exe ...
 copy /y "dist\mini-ide\mini-ide.exe" "..\mini-ide.exe" >nul
 if errorlevel 1 goto :fail_publish
@@ -110,11 +134,29 @@ if errorlevel 1 goto :fail_publish
 xcopy /e /i /y "dist\mini-ide-cli\mini-ide-runtime" "..\mini-ide-runtime" >nul
 if errorlevel 1 goto :fail_publish
 
+:commit_version
+if "%PACKAGE_ONLY%"=="1" (
+    "%VENV_PY%" scripts\release_version.py commit --root "%BUILD_DIR%" --output "pyinstaller-work\release-version" --release "dist\release"
+) else (
+    "%VENV_PY%" scripts\release_version.py commit --root "%BUILD_DIR%" --output "pyinstaller-work\release-version" --release ".."
+)
+if errorlevel 1 goto :fail_version
 echo.
+if "%PACKAGE_ONLY%"=="1" (
+    echo [build] Done. Output: _build\dist\release\ ^(running IDE unchanged^)
+    endlocal
+    exit /b 0
+)
 echo [build] Done. Output: mini-ide.exe + mini-ide-cli.exe + mini-ide-runtime\ (project root)
 endlocal
 exit /b 0
 
+:bad_args
+echo [build] Usage: build.bat [--package-only]
+exit /b 2
+:fail_version
+echo [build] Version metadata failed. The build is not marked successful.
+exit /b 1
 :no_python
 echo [build] ERROR: python not found. Install Python 3.11+ first.
 exit /b 1

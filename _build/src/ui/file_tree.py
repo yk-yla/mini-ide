@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread, background_tasks_suspended
+
 import logging
 import os
 import subprocess
@@ -83,7 +85,7 @@ _RENDER_CACHE_ROLE = Qt.ItemDataRole.UserRole + 2
 perf_log = logging.getLogger("mini-ide.performance")
 
 
-class _PasteWorker(QThread):
+class _PasteWorker(BackgroundThread):
     done = Signal(str, int, list, bool)  # target_dir, changed_count, failed messages, move
 
     def __init__(self, sources: list[str], target_dir: str, move: bool = False, parent=None):
@@ -98,7 +100,7 @@ class _PasteWorker(QThread):
         self.done.emit(str(target_dir), changed, failed, self._move)
 
 
-class _DirectoryLoadWorker(QThread):
+class _DirectoryLoadWorker(BackgroundThread):
     done = Signal(str, int, list, float)  # path, generation, entries, scan_ms
 
     def __init__(self, path: str, generation: int, parent=None):
@@ -199,6 +201,9 @@ class FileTree(QWidget):
         self._directory_generation: dict[str, int] = {}
         self._directory_workers: list[_DirectoryLoadWorker] = []
         self._directory_loading: set[str] = set()
+        self._render_epoch = 0
+        self._color_generation = 0
+        self._render_tokens = {}
         self._pending_expanded_paths: set[str] = set()
         self._pending_scroll_pos = 0
         self._pending_reveal_path = ""
@@ -466,16 +471,7 @@ class FileTree(QWidget):
         self._render_loaded_git_nodes()
 
     def _render_loaded_git_nodes(self) -> None:
-        def walk(parent: QTreeWidgetItem) -> None:
-            for index in range(parent.childCount()):
-                node = parent.child(index)
-                path = node.data(0, Qt.ItemDataRole.UserRole)
-                kind = node.data(0, Qt.ItemDataRole.UserRole + 1)
-                if path and kind in ("dir", "file"):
-                    node.setData(0, _RENDER_CACHE_ROLE, None)
-                    self._apply_git_color_to_node(node, Path(path))
-                walk(node)
-        walk(self.tree.invisibleRootItem())
+        self._refresh_all_colors(reset_cache=True)
 
     # ---- 加载 ----
 
@@ -485,7 +481,11 @@ class FileTree(QWidget):
         self._pending_expanded_paths = set(expanded)
         self._pending_scroll_pos = self.tree.verticalScrollBar().value()
         self._cancel_expand_all()
-
+        self._directory_loading.clear()
+        self._render_tokens.clear()
+        self._directory_generation = {path: generation + 1 for path, generation in self._directory_generation.items()}
+        self._render_epoch += 1
+        self._color_generation += 1
         self.tree.clear()
         root_item = QTreeWidgetItem([self.root_path.name])
         root_item.setData(0, Qt.ItemDataRole.UserRole, str(self.root_path))
@@ -529,13 +529,15 @@ class FileTree(QWidget):
     @staticmethod
     def _has_loading_placeholder(item: QTreeWidgetItem) -> bool:
         return (
-            item.childCount() == 1
+            item.childCount() >= 1
             and item.child(0).data(0, Qt.ItemDataRole.UserRole + 1) == "loading"
         )
 
     def _start_directory_load(
         self, parent_item: QTreeWidgetItem, parent_path: Path, *, force: bool = False,
     ) -> None:
+        if background_tasks_suspended():
+            return
         path = str(parent_path)
         if path in self._directory_loading and not force:
             return
@@ -567,31 +569,26 @@ class FileTree(QWidget):
     ) -> None:
         if generation != self._directory_generation.get(path):
             return
-        self._directory_loading.discard(path)
         parent_item = self._find_node_by_path(
             self.tree.invisibleRootItem(), path,
         )
         if parent_item is None:
             return
-        started = time.perf_counter()
-        self._render_directory_entries(parent_item, Path(path), entries)
-        duration_ms = (time.perf_counter() - started) * 1000
-        perf_log.info(
-            "perf op=directory-render duration_ms=%.1f files=%d status=done",
-            duration_ms, len(entries),
-        )
-        if self._pending_expanded_paths:
-            self._apply_expanded(parent_item, self._pending_expanded_paths)
-            self.tree.verticalScrollBar().setValue(self._pending_scroll_pos)
-        if self._pending_reveal_path:
-            self._continue_reveal_path()
-        if self._expand_all_pending:
-            self._queue_loaded_directories(parent_item)
-            QTimer.singleShot(0, self._expand_all_step)
+        def completed():
+            self._directory_loading.discard(path)
+            if self._pending_expanded_paths:
+                self._apply_expanded(parent_item, self._pending_expanded_paths)
+                self.tree.verticalScrollBar().setValue(self._pending_scroll_pos)
+            if self._pending_reveal_path:
+                self._continue_reveal_path()
+            if self._expand_all_pending:
+                self._queue_loaded_directories(parent_item)
+                QTimer.singleShot(0, self._expand_all_step)
+        self._render_directory_entries(parent_item, Path(path), entries, completed)
 
     def _render_directory_entries(
         self, parent_item: QTreeWidgetItem, parent_path: Path,
-        entries: list[tuple[str, str, str]],
+        entries: list[tuple[str, str, str]], on_done=None,
     ) -> None:
         """在主线程批量挂载 worker 返回的直接子项。"""
         # 预算 parent rel：避免对每个子项重复 relative_to
@@ -603,48 +600,80 @@ class FileTree(QWidget):
             parent_rel = ""
         prefix = (parent_rel + "/") if parent_rel else ""
 
-        nodes: list[QTreeWidgetItem] = []
-        existing_names: set[str] = set()
-        for kind, name, abs_path in entries:
-            existing_names.add(name.lower())
-            if kind == "dir":
-                node = QTreeWidgetItem(["📁  " + name])
-                loading = QTreeWidgetItem(["(loading...)"])
-                loading.setData(0, Qt.ItemDataRole.UserRole + 1, "loading")
-                node.addChild(loading)
-            else:
+        def build_nodes():
+            existing_names: set[str] = set()
+            for kind, name, abs_path in entries:
+                existing_names.add(name.lower())
+                if kind == "dir":
+                    node = QTreeWidgetItem(["📁  " + name])
+                    loading = QTreeWidgetItem(["(loading...)"])
+                    loading.setData(0, Qt.ItemDataRole.UserRole + 1, "loading")
+                    node.addChild(loading)
+                else:
+                    node = QTreeWidgetItem(["  " + name])
+                node.setData(0, Qt.ItemDataRole.UserRole, abs_path)
+                node.setData(0, Qt.ItemDataRole.UserRole + 1, kind)
+                self._apply_git_color_to_node(
+                    node, Path(abs_path), rel=prefix + name,
+                )
+                yield node
+            # git 已删除文件：磁盘上读不到，需要在父目录下补占位行
+            for name in self._git_deleted_by_parent.get(parent_rel, []):
+                # 避免与磁盘上同名条目重复（理论上不会，但 rename 等极端情况兜底）
+                if name.lower() in existing_names:
+                    continue
                 node = QTreeWidgetItem(["  " + name])
-            node.setData(0, Qt.ItemDataRole.UserRole, abs_path)
-            node.setData(0, Qt.ItemDataRole.UserRole + 1, kind)
-            self._apply_git_color_to_node(
-                node, Path(abs_path), rel=prefix + name,
-            )
-            nodes.append(node)
-        # git 已删除文件：磁盘上读不到，需要在父目录下补占位行
-        for name in self._git_deleted_by_parent.get(parent_rel, []):
-            # 避免与磁盘上同名条目重复（理论上不会，但 rename 等极端情况兜底）
-            if name.lower() in existing_names:
-                continue
-            node = QTreeWidgetItem(["  " + name])
-            # 占位节点没有真实路径，但记下"原本应该在哪"以便 tooltip
-            virtual_path = (parent_path / name)
-            node.setData(0, Qt.ItemDataRole.UserRole, str(virtual_path))
-            node.setData(0, Qt.ItemDataRole.UserRole + 1, "deleted")
-            node.setForeground(0, QColor(str(GIT_DEL)))
-            self._set_strikethrough(node, True)
-            node.setToolTip(0, self._STATUS_TOOLTIPS[GIT_STATUS_DELETED])
-            # 占位节点不可拖、不可改
-            flags = node.flags()
-            flags &= ~Qt.ItemFlag.ItemIsDragEnabled
-            flags &= ~Qt.ItemFlag.ItemIsEditable
-            node.setFlags(flags)
-            nodes.append(node)
-        self.tree.setUpdatesEnabled(False)
-        try:
-            parent_item.takeChildren()
-            parent_item.addChildren(nodes)
-        finally:
-            self.tree.setUpdatesEnabled(True)
+                # 占位节点没有真实路径，但记下"原本应该在哪"以便 tooltip
+                virtual_path = (parent_path / name)
+                node.setData(0, Qt.ItemDataRole.UserRole, str(virtual_path))
+                node.setData(0, Qt.ItemDataRole.UserRole + 1, "deleted")
+                node.setForeground(0, QColor(str(GIT_DEL)))
+                self._set_strikethrough(node, True)
+                node.setToolTip(0, self._STATUS_TOOLTIPS[GIT_STATUS_DELETED])
+                # 占位节点不可拖、不可改
+                flags = node.flags()
+                flags &= ~Qt.ItemFlag.ItemIsDragEnabled
+                flags &= ~Qt.ItemFlag.ItemIsEditable
+                node.setFlags(flags)
+                yield node
+
+        iterator = build_nodes()
+        epoch = self._render_epoch
+        token = object()
+        path_key = str(parent_path)
+        self._render_tokens[path_key] = token
+        # 保留 loading 标记直到末批挂载，定位/展开不会看到半成品。
+        parent_item.takeChildren()
+        marker = QTreeWidgetItem(["(loading...)"])
+        marker.setData(0, Qt.ItemDataRole.UserRole + 1, "loading")
+        parent_item.addChild(marker)
+        def step():
+            if epoch != self._render_epoch or self._render_tokens.get(path_key) is not token:
+                return
+            started = time.perf_counter()
+            nodes = []
+            finished = False
+            for _ in range(300):
+                try:
+                    nodes.append(next(iterator))
+                except StopIteration:
+                    finished = True
+                    break
+                if time.perf_counter() - started >= 0.006:
+                    break
+            try:
+                parent_item.addChildren(nodes)
+                if finished:
+                    parent_item.takeChild(parent_item.indexOfChild(marker))
+                    self._render_tokens.pop(path_key, None)
+                    if on_done:
+                        on_done()
+                else:
+                    QTimer.singleShot(0, self, step)
+            except RuntimeError:
+                # 父节点在其它刷新中已被 Qt 删除。
+                self._render_tokens.pop(path_key, None)
+        QTimer.singleShot(0, self, step)
 
     def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
         if self._has_loading_placeholder(item):
@@ -744,46 +773,41 @@ class FileTree(QWidget):
         font.setStrikeOut(enabled)
         node.setFont(0, font)
 
-    def _refresh_all_colors(self) -> None:
-        """迭代刷新整棵已加载子树的颜色。
-        用栈替代递归减小 Python 函数调用开销；命中节点级缓存的节点 setForeground 等
-        都不会触发，对 Qt 是零开销，整轮在大项目里稳定 < 5ms。
-        """
-        root_path_str = str(self.root_path)
-        root_path_len = len(root_path_str)
-        # 栈元素 (item, abs_path_str)，根节点先入栈
+    def _refresh_all_colors(self, reset_cache=False) -> None:
+        self._color_generation += 1
+        generation = self._color_generation
+        epoch = self._render_epoch
         top = self.tree.topLevelItem(0)
         if top is None:
             return
-        stack: list[tuple[QTreeWidgetItem, str]] = [(top, root_path_str)]
-        while stack:
-            item, abs_str = stack.pop()
-            kind = item.data(0, Qt.ItemDataRole.UserRole + 1)
-            if kind == "deleted":
-                # 删除占位节点在目录批量渲染时已经设好颜色，无需刷新
-                continue
-            # 计算 rel：剥离 root 前缀，比 Path.relative_to 快得多
-            if abs_str == root_path_str:
-                rel = ""
-            elif abs_str.startswith(root_path_str):
-                rel = abs_str[root_path_len:].lstrip("\\/").replace("\\", "/")
-            else:
-                continue
-            self._apply_git_color_to_node(item, Path(abs_str), rel=rel)
-            # 仅递归到已加载（非懒加载占位）的目录里
-            cc = item.childCount()
-            if cc == 0:
-                continue
-            if self._has_loading_placeholder(item):
-                continue
-            for i in range(cc):
+        def walk(item):
+            yield item
+            for i in range(item.childCount()):
                 child = item.child(i)
-                child_kind = child.data(0, Qt.ItemDataRole.UserRole + 1)
-                if child_kind not in ("dir", "file"):
-                    continue
-                child_abs = child.data(0, Qt.ItemDataRole.UserRole)
-                if child_abs:
-                    stack.append((child, child_abs))
+                if child.data(0, Qt.ItemDataRole.UserRole + 1) in ("dir", "file", "deleted"):
+                    yield from walk(child)
+        iterator = walk(top)
+        def step():
+            if generation != self._color_generation or epoch != self._render_epoch:
+                return
+            started = time.perf_counter()
+            try:
+                for _ in range(300):
+                    item = next(iterator)
+                    path = item.data(0, Qt.ItemDataRole.UserRole)
+                    kind = item.data(0, Qt.ItemDataRole.UserRole + 1)
+                    if reset_cache:
+                        item.setData(0, _RENDER_CACHE_ROLE, None)
+                    if kind == "deleted":
+                        item.setForeground(0, QColor(str(GIT_DEL)))
+                    elif path:
+                        self._apply_git_color_to_node(item, Path(path))
+                    if time.perf_counter() - started >= 0.008:
+                        break
+            except (StopIteration, RuntimeError):
+                return
+            QTimer.singleShot(0, self, step)
+        QTimer.singleShot(0, self, step)
 
     def _expand_all_safe(self) -> None:
         """逐个异步加载目录并展开，避免一次阻塞主线程。"""
@@ -850,6 +874,8 @@ class FileTree(QWidget):
         self._filter_timer.start()
 
     def _run_filter(self) -> None:
+        if background_tasks_suspended():
+            return
         text = self._pending_filter_text.strip()
         if not text or self.indexer is None:
             return
@@ -1298,6 +1324,11 @@ class FileTree(QWidget):
 
     def stop_workers(self) -> None:
         """停止当前控件发起的可中断后台任务，不在主线程等待。"""
+        self._render_epoch += 1
+        self._color_generation += 1
+        self._render_tokens.clear()
+        self._directory_generation = {path: generation + 1 for path, generation in self._directory_generation.items()}
+        self._directory_loading.clear()
         self._filter_timer.stop()
         self._cancel_file_search()
         self._pending_reveal_path = ""

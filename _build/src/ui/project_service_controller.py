@@ -7,9 +7,63 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QCoreApplication, QEventLoop
+from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from src.core.launch_tracker import LaunchTracker
+from src.core.search_worker_lifecycle import BackgroundThread, background_tasks_suspended
+
+
+class _ExternalStopWorker(BackgroundThread):
+    done = Signal(bool)
+
+    def __init__(self, pid):
+        super().__init__()
+        self.pid = pid
+
+    def run(self):
+        from src.core.process_runner import kill_pid
+        self.done.emit(kill_pid(self.pid))
+
+
+class _StoppedPortsWorker(BackgroundThread):
+    done = Signal(bool)
+
+    def __init__(self, ports):
+        super().__init__()
+        self.ports = ports
+
+    def run(self):
+        from src.core.process_runner import is_port_listening
+        stopped = True
+        for port in self.ports:
+            if self.isInterruptionRequested():
+                return
+            stopped = not is_port_listening(port) and stopped
+        self.done.emit(stopped)
+
+
+class _ExternalStopResult(QObject):
+    def __init__(self, controller, module, pid):
+        super().__init__(controller.tab)
+        self.controller, self.module, self.pid = controller, module, pid
+
+    @Slot(bool)
+    def completed(self, ok):
+        c, tab, module, pid = self.controller, self.controller.tab, self.module, self.pid
+        if ok:
+            if tab._module_external_pids.get(module) == pid:
+                tab._module_external_pids.pop(module, None)
+            if module == "__nginx__":
+                tab._nginx_status = None
+        else:
+            c._external_stop_error = f"failed to stop {module} (PID {pid})"
+            tab.log.append_line("stderr", f"[停止失败] {module} (PID {pid})")
+
+    @Slot()
+    def finished(self):
+        self.controller._external_stops.pop(self.module, None)
+        self.controller.tab._refresh_status_row()
+        self.deleteLater()
 
 
 class ProjectServiceController:
@@ -19,6 +73,68 @@ class ProjectServiceController:
         # prepare_compile() 和真正 runner.start() 之间虽然都在 GUI 主线程，仍用显式
         # reservation 表达不变量，避免 processEvents 或未来重构重新引入启停竞态。
         self._compile_reserved = False
+        self._operation = None
+        self._operation_invoking = False
+        self._external_stops = {}
+        self._external_stop_error = ""
+
+    def operation_error(self) -> dict | None:
+        if self._operation is not None and not self._operation_invoking:
+            return {"ok": False, "code": "service_operation_in_progress", "error": "another service operation is in progress"}
+        return None
+
+    def request(self, action: str, module=None, on_done=None, timeout_ms=None) -> dict:
+        """GUI/CLI 共用异步入口；回调报告最终结果，pending 仅表示受理。"""
+        error = self.operation_error() or self.validate_module(module)
+        if background_tasks_suspended():
+            error = {"ok": False, "error": "IDE is preparing to quit"}
+        if action not in ("start", "stop", "restart"):
+            error = {"ok": False, "error": "invalid service action"}
+        if not error and action != "stop":
+            error = self.service_start_error()
+        if error:
+            if on_done:
+                on_done(error)
+            return error
+        if timeout_ms is None:
+            timeout_ms = 15000 if action == "stop" else 90000
+        operation = _ServiceOperation(self, action, module, on_done, timeout_ms)
+        self._operation = operation
+        QTimer.singleShot(0, self.tab, operation.begin)
+        return {"ok": True, "pending": True}
+
+    def request_gui(self, action: str, module=None) -> dict:
+        from PySide6.QtWidgets import QMessageBox
+        tab = self.tab
+        if tab.project_meta.spring_boot_modules:
+            tab._detect_and_apply_external()
+        external = [name for name in tab._module_external_pids if not module or name == module]
+        if external:
+            names = "、".join(external)
+            answer = QMessageBox.question(tab, "服务在外部运行",
+                f"{names} 在 mini-ide 之外运行，本次操作将先停止这些进程。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return {"ok": False, "error": "cancelled"}
+        def completed(result):
+            if not result.get("ok") and result.get("error") not in ("already running", "not running"):
+                self.tab.log.append_line("stderr", f"[服务操作失败] {result.get('error', '')}")
+            self.tab._refresh_status_row()
+        return self.request(action, module, completed)
+
+    def stop_external(self, module: str, pid: int) -> bool:
+        if module in self._external_stops:
+            return True
+        worker = _ExternalStopWorker(pid)
+        self._external_stops[module] = worker
+        receiver = _ExternalStopResult(self, module, pid)
+        # 接收对象是 Tab，销毁后自动断连；worker 仍由应用持有。
+        worker.done.connect(receiver.completed)
+        worker.finished.connect(receiver.finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        return True
 
     def validate_module(self, module: str | None) -> dict | None:
         if module:
@@ -97,6 +213,9 @@ class ProjectServiceController:
         return list(dict.fromkeys(sorted(running)))
 
     def build_start_error(self) -> dict | None:
+        error = self.operation_error()
+        if error or self._external_stops:
+            return error or {"ok": False, "error": "service stop is still in progress"}
         running = self.running_service_names_for_build()
         if running:
             return {
@@ -114,6 +233,15 @@ class ProjectServiceController:
         return None
 
     def service_start_error(self) -> dict | None:
+        error = self.operation_error()
+        if error:
+            return error
+        if getattr(self.tab, "_runtime_start_pending", False) and not self._operation_invoking:
+            return {"ok": False, "error": "runtime dependency startup is in progress"}
+        if self.tab.project_meta.project_type == "nginx" and self.runner_busy(self.tab.runner):
+            return {"ok": False, "error": "nginx command is still in progress"}
+        if self._external_stops or any(self.runner_busy(r) for r in getattr(self.tab, "_runtime_stop_runners", {}).values()):
+            return {"ok": False, "error": "service stop is still in progress"}
         tab = self.tab
         if self._compile_reserved:
             return {
@@ -164,6 +292,17 @@ class ProjectServiceController:
         pid_getter = getattr(runner, "process_id", None)
         pid = pid_getter() if callable(pid_getter) else None
         self._launches.started(self.launch_target(module), generation, pid)
+        if hasattr(runner, "started") and runner.state() == "starting":
+            previous = getattr(runner, "_mini_ide_pid_hook", None)
+            if previous is not None:
+                runner.started.disconnect(previous)
+            target = self.launch_target(module)
+            def update_pid():
+                self._launches.started(target, generation, runner.process_id())
+                runner.started.disconnect(update_pid)
+                runner._mini_ide_pid_hook = None
+            runner._mini_ide_pid_hook = update_pid
+            runner.started.connect(update_pid)
 
     def launch_failed(self, module: str | None, generation: int) -> None:
         self._launches.failed_to_start(self.launch_target(module), generation)
@@ -221,163 +360,10 @@ class ProjectServiceController:
         return {"ok": True} if ok else {"ok": False, "error": "failed to start project"}
 
     def stop(self, module: str | None = None) -> dict:
-        tab = self.tab
-        if tab.project_meta.project_type == "nginx":
-            if module and module != tab.project_meta.name:
-                return {"ok": False, "error": f"module not found: {module}"}
-            if not tab._detect_nginx_status().running:
-                return {"ok": False, "error": "not running"}
-            return {"ok": bool(tab._stop_nginx_external())}
-
-        invalid = self.validate_module(module)
-        if invalid:
-            return invalid
-
-        if tab._is_multi_module:
-            if tab.project_meta.spring_boot_modules:
-                try:
-                    tab._detect_and_apply_external()
-                except Exception:
-                    # 调用方会记录异常日志；这里保持命令可继续执行。
-                    pass
-            if module:
-                invalid = self.validate_module(module)
-                if invalid:
-                    return invalid
-                runner = tab.module_runners.get(module)
-                running = runner and self.runner_busy(runner)
-                external = module in tab._module_external_pids
-                port = self.module_port(module)
-                unit = tab.project_meta.runtime_unit(module)
-                detached = bool(
-                    unit and unit.stop_command and port
-                    and self._port_is_listening(port)
-                )
-                if not running and not external and not detached:
-                    return {"ok": False, "error": "not running"}
-                if not tab._stop_module(module, silent=True):
-                    return {"ok": False, "error": "failed to stop module"}
-                if not self.wait_module_stopped(module, 12000, port):
-                    return {"ok": False, "error": "stop timeout"}
-                tab._refresh_status_row()
-                return {"ok": True}
-
-            ports = {
-                name: self.module_port(name)
-                for name in self.module_names()
-            }
-            if self.runner_busy(tab.runner):
-                tab._stop()
-                if not self.wait_runner_stop(tab.runner, 10000):
-                    return {"ok": False, "error": "stop timeout"}
-            tab._stop_all_modules(silent=True)
-            for runner in list(tab.module_runners.values()):
-                if self.runner_busy(runner):
-                    if not self.wait_runner_stop(runner, 10000):
-                        return {"ok": False, "error": "stop timeout"}
-            for mod_name, port in ports.items():
-                if not self.wait_module_stopped(mod_name, 12000, port):
-                    return {"ok": False, "error": "stop timeout"}
-            tab._refresh_status_row()
-            return {"ok": True}
-
-        unit = tab.project_meta.runtime_units[0] if tab.project_meta.runtime_units else None
-        port = unit.expected_port if unit is not None else tab.project_meta.default_port
-        detached = bool(
-            unit and unit.stop_command and port and self._port_is_listening(port)
-        )
-        if not self.runner_busy(tab.runner) and not detached:
-            return {"ok": False, "error": "not running"}
-        if not tab._stop():
-            return {"ok": False, "error": "failed to stop project"}
-        if not self.wait_project_stopped(12000, port):
-            return {"ok": False, "error": "stop timeout"}
-        return {"ok": True}
+        return self.request("stop", module)
 
     def restart(self, module: str | None = None) -> dict:
-        tab = self.tab
-        if tab.project_meta.project_type == "nginx":
-            if module and module != tab.project_meta.name:
-                return {"ok": False, "error": f"module not found: {module}"}
-            if tab._detect_nginx_status().running:
-                tab._stop_nginx_external()
-            return {"ok": bool(tab._start_nginx())}
-
-        invalid = self.validate_module(module)
-        if invalid:
-            return invalid
-
-        conflict = self.service_start_error()
-        if conflict:
-            return conflict
-
-        if tab._is_multi_module:
-            if module:
-                invalid = self.validate_module(module)
-                if invalid:
-                    return invalid
-                runner = tab.module_runners.get(module)
-                port = self.module_port(module)
-                if tab.project_meta.spring_boot_modules:
-                    tab._detect_and_apply_external()
-                unit = tab.project_meta.runtime_unit(module)
-                active = bool(runner and self.runner_busy(runner))
-                active = active or module in tab._module_external_pids
-                active = active or bool(
-                    unit and unit.stop_command and port
-                    and self._port_is_listening(port)
-                )
-                if active:
-                    if not tab._stop_module(module, silent=True):
-                        return {"ok": False, "error": "failed to stop module"}
-                    if not self.wait_module_stopped(module, 15000, port):
-                        return {"ok": False, "error": "stop timeout"}
-                ok = bool(tab._start_module(module, silent=True))
-                return {"ok": True} if ok else {"ok": False, "error": "failed to restart module"}
-
-            ports = {
-                name: self.module_port(name)
-                for name in self.module_names()
-            }
-            tab._stop_all_modules(silent=True)
-            deadline = time.time() + 15
-            for runner in list(tab.module_runners.values()):
-                remaining = max(0, int((deadline - time.time()) * 1000))
-                if remaining <= 0 or not self.wait_runner_stop(runner, remaining):
-                    return {"ok": False, "error": "stop timeout"}
-            for mod_name, port in ports.items():
-                remaining = max(0, int((deadline - time.time()) * 1000))
-                if remaining <= 0 or not self.wait_module_stopped(mod_name, remaining, port):
-                    return {"ok": False, "error": "stop timeout"}
-            ok = bool(tab._start_all_modules(silent=True))
-            return {"ok": True} if ok else {"ok": False, "error": "failed to restart one or more modules"}
-
-        unit = tab.project_meta.runtime_units[0] if tab.project_meta.runtime_units else None
-        port = unit.expected_port if unit is not None else tab.project_meta.default_port
-        active = self.runner_busy(tab.runner)
-        active = active or bool(
-            unit and unit.stop_command and port and self._port_is_listening(port)
-        )
-        if active:
-            if not tab._stop():
-                return {"ok": False, "error": "failed to stop project"}
-            if not self.wait_project_stopped(15000, port):
-                return {"ok": False, "error": "stop timeout"}
-        primary = next((p for p in tab.project_meta.profiles if p.primary), None)
-        if not primary:
-            return {"ok": False, "error": "no run profile found"}
-        ok = bool(tab._start_profile(primary))
-        return {"ok": True} if ok else {"ok": False, "error": "failed to restart project"}
-
-    def wait_runner_stop(self, runner, timeout_ms: int) -> bool:
-        # 必须等进程真正退出（状态回到 idle）才算停好，不能一离开 running 就返回。
-        # stop() 会先把状态置为 stopping、再到后台慢慢杀进程树；若这里只看
-        # is_running()（stopping 时即为 False）就提前返回，调用方会立刻重启并把
-        # 「手动停止」标记清掉，等旧进程真正退出时就被误判成异常崩溃，弹红框。
-        deadline = time.time() + timeout_ms / 1000.0
-        while self.runner_busy(runner) and time.time() < deadline:
-            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-        return not self.runner_busy(runner)
+        return self.request("restart", module)
 
     def runner_busy(self, runner) -> bool:
         if runner.state() != "idle":
@@ -398,58 +384,6 @@ class ProjectServiceController:
             if name == module:
                 return port
         return None
-
-    def wait_module_stopped(
-        self,
-        module: str,
-        timeout_ms: int,
-        port: int | None = None,
-    ) -> bool:
-        from src.core.process_runner import is_port_listening
-
-        tab = self.tab
-        deadline = time.time() + timeout_ms / 1000.0
-        while time.time() < deadline:
-            runner = tab.module_runners.get(module)
-            active = bool(runner and self.runner_busy(runner))
-            stop_runner = tab._runtime_stop_runners.get(module)
-            if stop_runner is not None and self.runner_busy(stop_runner):
-                active = True
-            if tab.project_meta.spring_boot_modules:
-                try:
-                    tab._detect_and_apply_external()
-                except Exception:
-                    pass
-            if module in tab._module_external_pids:
-                active = True
-            if port and is_port_listening(port):
-                active = True
-            if not active:
-                return True
-            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-        return False
-
-    def wait_project_stopped(self, timeout_ms: int, port: int | None = None) -> bool:
-        from src.core.process_runner import is_port_listening
-
-        tab = self.tab
-        deadline = time.time() + timeout_ms / 1000.0
-        while time.time() < deadline:
-            active = self.runner_busy(tab.runner)
-            if any(self.runner_busy(r) for r in tab._runtime_stop_runners.values()):
-                active = True
-            if port and is_port_listening(port):
-                active = True
-            if not active:
-                return True
-            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 100)
-        return False
-
-    @staticmethod
-    def _port_is_listening(port: int) -> bool:
-        from src.core.process_runner import is_port_listening
-
-        return is_port_listening(port)
 
     def target_modules(self, module: str | None) -> list[str]:
         if self.tab._is_multi_module:
@@ -680,3 +614,181 @@ class ProjectServiceController:
         if not started.get("ok"):
             return started
         return {"ok": True, "runner": prepared["runner"]}
+
+
+class _ServiceOperation(QObject):
+    def __init__(self, controller, action, module, on_done, timeout_ms):
+        super().__init__(controller.tab)
+        self.controller, self.action, self.module = controller, action, module
+        self.on_done = on_done
+        self.deadline = time.monotonic() + max(0, timeout_ms) / 1000
+        self.stop_deadline = min(self.deadline, time.monotonic() + 15)
+        self.phase = "stop"
+        self.ports = []
+        self.probe = None
+        self.timer = QTimer(self)
+        self.timer.setInterval(50)
+        self.timer.timeout.connect(self.poll)
+        self.result_sent = False
+        self.stop_targets = None
+        controller.tab.destroyed.connect(self.tab_destroyed)
+
+    def tab_destroyed(self):
+        if not self.result_sent:
+            self.result_sent = True
+            if self.on_done:
+                self.on_done({"ok": False, "error": "project was closed during service operation"})
+        if self.probe is not None:
+            self.probe.requestInterruption()
+
+    def begin(self):
+        c, tab = self.controller, self.controller.tab
+        if background_tasks_suspended():
+            self.finish({"ok": False, "error": "IDE is preparing to quit"})
+            return
+        c._external_stop_error = ""
+        if tab._is_multi_module and tab.project_meta.spring_boot_modules:
+            tab._detect_and_apply_external()
+        if tab._is_multi_module:
+            names = [self.module] if self.module else c.module_names()
+            self.ports = [c.module_port(name) for name in names if c.module_port(name)]
+        else:
+            unit = tab.project_meta.runtime_units[0] if tab.project_meta.runtime_units else None
+            port = unit.expected_port if unit else tab.project_meta.default_port
+            self.ports = [port] if port else []
+        nginx = tab.project_meta.project_type == "nginx"
+        status = tab._detect_nginx_status() if nginx else None
+        if status and status.running:
+            self.ports = list(status.ports)
+        takeover = self.action == "start" and bool(tab._module_external_pids) and (not self.module or self.module in tab._module_external_pids)
+        if takeover:
+            self.stop_targets = [name for name in tab._module_external_pids if not self.module or name == self.module]
+            self.ports = [c.module_port(name) for name in self.stop_targets if c.module_port(name)]
+        if self.action == "start" and not takeover:
+            self.launch()
+            return
+        active = bool(c.active_modules(self.module)) or bool(status and status.running)
+        if self.action == "stop" and not active and not self.ports and not (tab._is_multi_module and not self.module):
+            self.finish({"ok": False, "error": "not running"})
+            return
+        c._operation_invoking = True
+        try:
+            if takeover:
+                for name in self.stop_targets:
+                    if not tab._stop_module(name, silent=True):
+                        self.finish({"ok": False, "error": f"failed to stop external module: {name}"})
+                        return
+            elif nginx:
+                if status and status.running:
+                    tab._stop_nginx_external()
+                if c.runner_busy(tab.runner):
+                    tab.runner.stop()
+            elif tab._is_multi_module:
+                if self.module:
+                    runner = tab.module_runners.get(self.module)
+                    if active or self.ports or (runner and c.runner_busy(runner)):
+                        if not tab._stop_module(self.module, silent=True):
+                            self.finish({"ok": False, "error": "failed to stop module"})
+                            return
+                else:
+                    tab._stop_all_modules(silent=True)
+                    if c.runner_busy(tab.runner):
+                        tab._stop()
+            elif active or self.ports or c.runner_busy(tab.runner):
+                if not tab._stop():
+                    self.finish({"ok": False, "error": "failed to stop project"})
+                    return
+        except Exception as exc:
+            self.finish({"ok": False, "error": str(exc)})
+            return
+        finally:
+            c._operation_invoking = False
+        self.timer.start()
+        self.poll()
+
+    def runners(self):
+        tab = self.controller.tab
+        if tab._is_multi_module:
+            names = self.stop_targets if self.phase == "stop" and self.stop_targets is not None else ([self.module] if self.module else self.controller.module_names())
+            return [tab.module_runners[name] for name in names if name in tab.module_runners]
+        return [tab.runner]
+
+    def poll(self):
+        if self.result_sent:
+            return
+        c, tab = self.controller, self.controller.tab
+        deadline = self.stop_deadline if self.phase == "stop" else self.deadline
+        if time.monotonic() >= deadline:
+            self.finish({"ok": False, "error": f"{self.phase} timeout"})
+            return
+        if self.phase == "start":
+            if getattr(tab, "_runtime_start_pending", False):
+                return
+            if getattr(tab, "_runtime_start_error", ""):
+                self.finish({"ok": False, "error": tab._runtime_start_error})
+                return
+            if any(r.state() == "starting" for r in self.runners()):
+                return
+            errors = [getattr(r, "_last_start_error", "") for r in self.runners()]
+            error = next((error for error in errors if error), None)
+            self.finish({"ok": False, "error": error} if error else {"ok": True})
+            return
+        if c._external_stop_error:
+            self.finish({"ok": False, "error": c._external_stop_error})
+            return
+        if any(c.runner_busy(r) for r in self.runners()) or c._external_stops:
+            return
+        if any(c.runner_busy(r) for r in tab._runtime_stop_runners.values()):
+            return
+        if self.probe is None:
+            worker = _StoppedPortsWorker(self.ports)
+            self.probe = worker
+            worker.done.connect(self.ports_checked)
+            worker.finished.connect(self.probe_finished)
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
+
+    def probe_finished(self):
+        self.probe = None
+
+    def ports_checked(self, stopped):
+        if self.result_sent or not stopped:
+            return
+        if self.action == "stop":
+            self.finish({"ok": True})
+        else:
+            self.launch()
+
+    def launch(self):
+        c = self.controller
+        self.phase = "start"
+        if self.module:
+            c.tab._runtime_start_error = ""
+        c._operation_invoking = True
+        try:
+            result = c.start(self.module)
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        finally:
+            c._operation_invoking = False
+        if not result.get("ok"):
+            self.finish(result)
+            return
+        self.timer.start()
+        self.poll()
+
+    def finish(self, result):
+        if self.result_sent:
+            return
+        self.result_sent = True
+        if not result.get("ok") and getattr(self.controller.tab, "_runtime_start_pending", False):
+            self.controller.tab._runtime_start_generation += 1
+            self.controller.tab._runtime_start_pending = False
+        self.timer.stop()
+        if self.probe is not None:
+            self.probe.requestInterruption()
+        if self.controller._operation is self:
+            self.controller._operation = None
+        if self.on_done:
+            self.on_done(result)
+        self.deleteLater()

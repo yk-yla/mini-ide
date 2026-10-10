@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread, background_tasks_suspended
+
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -91,7 +93,7 @@ class ContentMatch:
     col_end: int
 
 
-class SearchWorker(QThread):
+class SearchWorker(BackgroundThread):
     match_found = Signal(list)   # list[ContentMatch]
     progress = Signal(int, int)  # files_scanned, matches_found
     done = Signal(int, int)      # total_files_scanned, total_matches
@@ -543,6 +545,8 @@ class ContentSearchDialog(QDialog):
         return self._file_cache
 
     def _start_search(self) -> None:
+        if background_tasks_suspended():
+            return
         self._debounce.stop()
         query = self.input.text().strip()
         if not query:

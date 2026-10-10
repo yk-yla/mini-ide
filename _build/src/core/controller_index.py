@@ -9,6 +9,8 @@ getCategoryList）模糊定位到 Controller 方法。
 """
 from __future__ import annotations
 
+from src.core.search_worker_lifecycle import BackgroundThread, background_tasks_suspended
+
 import os
 import re
 from dataclasses import dataclass
@@ -152,6 +154,8 @@ class ControllerIndexer(QObject):
         self._endpoints: list[Endpoint] = []
         self._built = False
         self._worker: _ControllerWorker | None = None
+        self._restart_requested = False
+        self._stopping = False
 
     def is_built(self) -> bool:
         return self._built
@@ -160,21 +164,43 @@ class ControllerIndexer(QObject):
         return self._worker is not None and self._worker.isRunning()
 
     def build_async(self) -> None:
-        if self._built or self.is_building():
+        if background_tasks_suspended():
+            return
+        self._stopping = False
+        if self.is_building():
+            if self._worker.isInterruptionRequested():
+                self._restart_requested = True
+            return
+        if self._built:
             return
         self._worker = _ControllerWorker(self.root)
         self._worker.done.connect(self._on_done)
+        self._worker.finished.connect(self._on_worker_finished)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
+    def _on_worker_finished(self) -> None:
+        if self.sender() is self._worker:
+            self._worker = None
+            if self._restart_requested and not self._stopping:
+                self._restart_requested = False
+                self.build_async()
+
     def _on_done(self, endpoints: list) -> None:
+        if self._stopping:
+            return
         self._endpoints = endpoints
         self._built = True
-        self._worker = None
         self.ready.emit(len(endpoints))
 
     def count(self) -> int:
         return len(self._endpoints)
+
+    def stop(self) -> None:
+        self._stopping = True
+        self._restart_requested = False
+        if self._worker and self._worker.isRunning():
+            self._worker.requestInterruption()
 
     def search(self, query: str, limit: int = 100) -> list[Endpoint]:
         """按路径模糊匹配。query 里的 / 和大小写都忽略，按子序列+子串打分。"""
@@ -215,7 +241,7 @@ def _ep_score(ep: Endpoint, q: str) -> int:
     return 100 if qflat else 0
 
 
-class _ControllerWorker(QThread):
+class _ControllerWorker(BackgroundThread):
     done = Signal(list)
 
     def __init__(self, root: str):
@@ -226,8 +252,12 @@ class _ControllerWorker(QThread):
     def run(self) -> None:
         endpoints: list[Endpoint] = []
         for dirpath, dirnames, filenames in os.walk(self.root):
+            if self.isInterruptionRequested():
+                return
             prune_scan_dirnames(Path(dirpath), dirnames, self.excluded_roots)
             for fn in filenames:
+                if self.isInterruptionRequested():
+                    return
                 if not fn.endswith(".java"):
                     continue
                 abs_p = Path(dirpath) / fn
