@@ -63,24 +63,34 @@ def _overview_signature(
 
 
 class _OverviewWorker(BackgroundThread):
-    done = Signal(str, str, list, dict, str)  # root, branch, files, numstat, signature
+    statusReady = Signal(str, object)
+    done = Signal(object, dict, str)  # snapshot, numstat, signature
+    failed = Signal(object, str)
 
     def __init__(self, root: str, parent=None):
         super().__init__(parent)
         self.root = root
+        self.started_ns = 0
 
     def run(self) -> None:
         started = time.perf_counter()
-        root = git_ops.repo_root(self.root)
-        branch = git_ops.current_branch(root)
-        files = git_ops.list_changed_files(root)
-        stats = git_ops.diff_numstat(root)
-        signature = _overview_signature(root, branch, files)
-        perf_log.info(
-            "perf op=git-overview-worker duration_ms=%.1f files=%d status=done",
-            (time.perf_counter() - started) * 1000, len(files),
-        )
-        self.done.emit(root, branch, files, stats, signature)
+        self.started_ns = time.monotonic_ns()
+        try:
+            root = git_ops.repo_root(self.root)
+            snapshot = git_ops.read_status_snapshot(root)
+            if self.isInterruptionRequested():
+                return
+            self.statusReady.emit(root, snapshot)
+            stats = git_ops.diff_numstat(root)
+            signature = _overview_signature(root, snapshot.branch, snapshot.files)
+            perf_log.info(
+                "perf op=git-overview-worker duration_ms=%.1f files=%d status=done",
+                (time.perf_counter() - started) * 1000, len(snapshot.files),
+            )
+            self.done.emit(snapshot, stats, signature)
+        except Exception as error:
+            perf_log.exception("Git 改动刷新失败: %s", self.root)
+            self.failed.emit(self.started_ns, str(error))
 
 
 class _FileDiffWorker(BackgroundThread):
@@ -145,6 +155,7 @@ class GitViewer(QDialog):
 
     # 用户选择「跳转到文件」：参数是绝对路径。ProjectTab 连接这里打开内嵌 tab
     openFileRequested = Signal(str)
+    statusUpdated = Signal(object)
 
     def __init__(self, project_root: str, parent=None):
         super().__init__(parent)
@@ -157,6 +168,8 @@ class GitViewer(QDialog):
         self._pending_diff = None
         self._numstat: dict[str, tuple[int, int]] = {}
         self._last_signature = ""
+        self._status_started_ns = 0
+        self._reload_pending = False
         self._selected_path = ""
         self._current_branch = ""
         self._current_files: list[git_ops.ChangedFile] = []
@@ -375,38 +388,70 @@ class GitViewer(QDialog):
         if self._closing:
             return
         if self._overview_worker and self._overview_worker.isRunning():
+            self._reload_pending |= force
             return
-        if force and not self._last_signature:
+        if force and not self._status_started_ns:
             self.diff_view.setPlainText("正在加载本地改动...")
         worker = _OverviewWorker(self.root, parent=QApplication.instance())
         self._overview_worker = worker
+        self._reload_pending = False
+        worker.statusReady.connect(self._on_status_loaded)
         worker.done.connect(self._on_overview_loaded)
+        worker.failed.connect(self._on_overview_failed)
+        worker.finished.connect(self._on_overview_finished)
         self._track_worker(worker)
         worker.start()
 
+    def apply_status_snapshot(self, snapshot) -> bool:
+        if self._closing or snapshot.started_ns <= self._status_started_ns:
+            return False
+        changed = snapshot.branch != self._current_branch or snapshot.files != self._current_files
+        self._status_started_ns = snapshot.started_ns
+        self._update_header(snapshot.branch, snapshot.files)
+        if changed:
+            self._numstat = {}
+            self._last_signature = ""
+            self._load_changes(snapshot.files)
+        return True
+
+    def _on_status_loaded(self, root: str, snapshot) -> None:
+        if self._closing or self.sender() is not self._overview_worker:
+            return
+        self.root = root
+        self.setWindowTitle(f"Git 改动 — {self.root}")
+        if self.apply_status_snapshot(snapshot):
+            self.statusUpdated.emit(snapshot)
+
     def _on_overview_loaded(
-        self, root: str, branch: str, files: list[git_ops.ChangedFile],
-        stats: dict, signature: str,
+        self, snapshot, stats: dict, signature: str,
     ) -> None:
         if self._closing:
             return
         if self.sender() is not self._overview_worker:
             return
+        if snapshot.started_ns != self._status_started_ns:
+            return
         started = time.perf_counter()
-        self._overview_worker = None
-        self.root = root
-        self.setWindowTitle(f"Git 改动 — {self.root}")
         self._numstat = stats
-        self._update_header(branch, files)
         if signature != self._last_signature:
             self._last_signature = signature
-            self._load_changes(files)
+            self._load_changes(snapshot.files)
         duration_ms = (time.perf_counter() - started) * 1000
         if duration_ms >= 20:
             perf_log.info(
                 "perf op=git-overview-render duration_ms=%.1f files=%d status=done",
-                duration_ms, len(files),
+                duration_ms, len(snapshot.files),
             )
+
+    def _on_overview_failed(self, started_ns, error: str) -> None:
+        if not self._closing and started_ns >= self._status_started_ns:
+            self.lbl_summary.setText(f"刷新失败，保留上次结果：{error}")
+
+    def _on_overview_finished(self) -> None:
+        if self.sender() is self._overview_worker:
+            self._overview_worker = None
+            if self._reload_pending and not self._closing:
+                QTimer.singleShot(0, self._reload)
 
     def _track_worker(self, worker: QThread) -> None:
         self._active_workers.append(worker)

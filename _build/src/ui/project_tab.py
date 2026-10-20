@@ -21,7 +21,7 @@ from src.core.file_index import FileIndexer
 from src.core.git_worker import (
     GitBranchListWorker, GitCheckoutRemoteWorker, GitCheckoutWorker,
     GitDeleteLocalBranchWorker, GitDirtyCheckWorker, GitFetchWorker,
-    GitMergePushWorker, GitStatusWorker,
+    GitMergePushWorker, GitStatusDetailsWorker, GitStatusWorker,
 )
 from src.core.nginx_detector import detect_nginx
 from src.core.process_runner import ProcessRunner, RunContext
@@ -223,6 +223,12 @@ class ProjectTab(QWidget):
         self._git_delete_branch_worker: GitDeleteLocalBranchWorker | None = None
         self._git_merge_worker: GitMergePushWorker | None = None
         self._git_status_worker: GitStatusWorker | None = None
+        self._git_details_worker: GitStatusDetailsWorker | None = None
+        self._git_snapshot = None
+        self._git_info = None
+        self._git_ignored: set[str] = set()
+        self._git_status_pending = False
+        self._git_refresh_enabled = True
         self._git_viewer = None
         self._merge_dialog = None
         # 启动完成标记：日志里看到 Started / ready in 等 marker 后，只给状态栏贴一次"✓ 启动完成"
@@ -247,6 +253,7 @@ class ProjectTab(QWidget):
         self._poll_start_timer.setSingleShot(True)
         self._poll_start_timer.timeout.connect(self._start_status_polling)
         self._poll_start_timer.start(250 + timer_offset)
+        QApplication.instance().applicationStateChanged.connect(self._on_application_state_changed)
 
         # 远程分支轮询：每 5 分钟 git fetch 一次，发现新提交时高亮分支按钮
         self._fetch_timer = QTimer(self)
@@ -1735,6 +1742,15 @@ class ProjectTab(QWidget):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         QTimer.singleShot(0, self._poll_status_if_visible)
+        QTimer.singleShot(0, self._request_git_refresh)
+
+    def _on_application_state_changed(self, state) -> None:
+        if state == Qt.ApplicationState.ApplicationActive:
+            self._request_git_refresh()
+
+    def _request_git_refresh(self) -> None:
+        if self.isVisible():
+            self._update_file_tree_git_colors(force=True)
 
     def _refresh_status_row(self) -> None:
         if self._is_multi_module:
@@ -1824,7 +1840,7 @@ class ProjectTab(QWidget):
 
         # git 分支 / 改动数 / 文件树染色：全部交给后台 worker 查，
         # 主线程不再同步跑 git 命令（否则大仓库每 3s 冻 UI 几百 ms）。
-        # worker 回来后在 _on_git_status_done 里一次性渲染状态栏 + 刷染色。
+        # 本地状态先渲染，忽略文件与上游统计由独立后台任务补充。
         self._update_file_tree_git_colors()
 
     def _render_git_status_row(self, info) -> None:
@@ -1860,51 +1876,107 @@ class ProjectTab(QWidget):
         else:
             self.btn_changes.setVisible(False)
 
-    def _update_file_tree_git_colors(self) -> None:
+    def _update_file_tree_git_colors(self, force: bool = False) -> None:
+        if (not self._git_refresh_enabled
+                or QApplication.instance().property("mini_ide_shutting_down")):
+            return
         # 非 git 项目：状态栏隐藏分支/改动按钮，不起 worker
         if not self._is_git_repo:
             self.btn_branch.setVisible(False)
             self.btn_changes.setVisible(False)
             return
-        # 防抖：上一轮 worker 还在跑就跳过这一轮（避免堆积）。
-        # 回收策略：finished→deleteLater 负责销毁 C++ 对象，done 回调里只把
-        # self._git_status_worker 置 None。下一轮看到 None 起新 worker，永远不再
-        # 通过该引用访问已被 deleteLater 的旧对象，因此既不泄漏也不会空壳崩溃。
-        # （旧实现为怕空壳崩溃而完全不回收，结果每 3s 漏一个 QThread，长开会耗尽句柄。）
+        # 定时请求不堆积；主动刷新最多补一轮，finished 清引用后再回收线程。
         w = self._git_status_worker
         if w is not None:
             try:
                 if w.isRunning():
+                    self._git_status_pending |= force
                     return
             except RuntimeError:
                 # 极端情况下对象已被回收，直接当作空闲，重新起一轮
                 self._git_status_worker = None
         worker = GitStatusWorker(self.project_meta.path, parent=self)
-        worker.done.connect(self._on_git_status_done)
+        worker.done.connect(self._on_git_snapshot_ready)
+        worker.failed.connect(self._on_git_status_failed)
+        worker.finished.connect(self._on_git_status_finished)
         worker.finished.connect(worker.deleteLater)
         self._git_status_worker = worker
+        self._git_status_pending = False
         worker.start()
 
-    def _on_git_status_done(
-        self, statuses: dict, ignored: set, deleted_by_parent: dict, info,
-    ) -> None:
-        started = time.perf_counter()
-        log.debug(
-            f"[git_colors] statuses={len(statuses)}, "
-            f"ignored={len(ignored)}, deleted_groups={len(deleted_by_parent)}"
+    def _on_git_snapshot_ready(self, snapshot) -> None:
+        if not self._git_refresh_enabled:
+            return
+        if self._git_snapshot and snapshot.started_ns <= self._git_snapshot.started_ns:
+            return
+        self._git_snapshot = snapshot
+        previous = self._git_info
+        same_branch = previous and previous.branch == snapshot.branch
+        self._git_info = git_info.GitInfo(
+            branch=snapshot.branch, changed=len(snapshot.files), dirty=bool(snapshot.files),
+            ahead=previous.ahead if same_branch else 0,
+            behind=previous.behind if same_branch else 0,
         )
-        self._render_git_status_row(info)
-        self.file_tree.update_git_status(statuses, ignored, deleted_by_parent)
+        self._render_git_status_row(self._git_info)
+        self.btn_changes.setToolTip("查看当前分支改动文件")
+        self.file_tree.update_git_status(
+            snapshot.statuses, self._git_ignored, snapshot.deleted_by_parent,
+        )
+        if self._git_viewer is not None:
+            self._git_viewer.apply_status_snapshot(snapshot)
+        self._start_git_details()
+
+    def _start_git_details(self) -> None:
+        if (not self._git_refresh_enabled or self._git_snapshot is None
+                or not self.isVisible()
+                or QApplication.instance().property("mini_ide_shutting_down")):
+            return
+        if self._git_details_worker is not None:
+            return
+        worker = GitStatusDetailsWorker(self.project_meta.path, self._git_snapshot, parent=self)
+        worker.done.connect(self._on_git_details_done)
+        worker.finished.connect(self._on_git_details_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._git_details_worker = worker
+        worker.start()
+
+    def _on_git_details_done(
+        self, snapshot, ignored: set, info,
+    ) -> None:
+        if not self._git_refresh_enabled or self._git_snapshot is None:
+            return
+        started = time.perf_counter()
+        self._git_ignored = ignored
+        if (snapshot.started_ns == self._git_snapshot.started_ns
+                and info is not None and info.branch == snapshot.branch):
+            self._git_info = info
+            self._render_git_status_row(info)
+        current = self._git_snapshot
+        self.file_tree.update_git_status(current.statuses, ignored, current.deleted_by_parent)
         duration_ms = (time.perf_counter() - started) * 1000
         if duration_ms >= 20:
             perf_log.info(
                 "perf op=git-status-render duration_ms=%.1f files=%d status=done",
-                duration_ms, len(statuses),
+                duration_ms, len(snapshot.statuses),
             )
-        # 本轮结束：只在仍是当前 worker 时清引用（避免极端时序下把刚起的新 worker 误置空）。
-        # 对象本身由 finished→deleteLater 回收，这里不碰 C++ 生命周期。
+
+    def _on_git_details_finished(self) -> None:
+        worker = self._git_details_worker
+        if worker is not None and self.sender() is worker:
+            self._git_details_worker = None
+            if self._git_snapshot and worker.snapshot.started_ns != self._git_snapshot.started_ns:
+                self._start_git_details()
+
+    def _on_git_status_failed(self, started_ns, error: str) -> None:
+        if (self._git_refresh_enabled
+                and (self._git_snapshot is None or started_ns >= self._git_snapshot.started_ns)):
+            self.btn_changes.setToolTip(f"Git 刷新失败，保留上次结果：{error}")
+
+    def _on_git_status_finished(self) -> None:
         if self.sender() is self._git_status_worker:
             self._git_status_worker = None
+            if self._git_status_pending:
+                QTimer.singleShot(0, self._request_git_refresh)
 
     # ---- 文件跳转 ----
 
@@ -2442,6 +2514,8 @@ class ProjectTab(QWidget):
         return True
 
     def suspend_background_tasks(self) -> tuple[bool, bool]:
+        self._git_refresh_enabled = False
+        self._git_status_pending = False
         polling = (self._poll_timer.isActive() or self._poll_start_timer.isActive(),
                    self._fetch_timer.isActive() or self._fetch_start_timer.isActive())
         self._poll_timer.stop()
@@ -2457,6 +2531,7 @@ class ProjectTab(QWidget):
         return polling
 
     def resume_background_tasks(self, polling: tuple[bool, bool]) -> None:
+        self._git_refresh_enabled = True
         self.indexer.resume()
         self.file_tree._directory_loading.clear()
         self.file_tree._reload()
@@ -2508,6 +2583,8 @@ class ProjectTab(QWidget):
         self._fetch_timer.stop()
         self._poll_start_timer.stop()
         self._fetch_start_timer.stop()
+        self._git_refresh_enabled = False
+        self._git_status_pending = False
         for pane in self._file_panes.values():
             pane.stop_workers()
         self.indexer.stop()
@@ -2517,7 +2594,7 @@ class ProjectTab(QWidget):
         # Git 子进程可能受磁盘或网络影响。关闭 Tab 时把 worker 转交给应用回收，
         # 不在 UI 线程逐个 wait；接收者销毁后 Qt 会自动断开结果信号。
         for w in (self._git_branch_worker, self._git_dirty_worker,
-                  self._git_status_worker, self._git_fetch_worker,
+                  self._git_status_worker, self._git_details_worker, self._git_fetch_worker,
                   self._git_checkout_worker, self._git_checkout_remote_worker,
                   self._git_delete_branch_worker, self._git_merge_worker):
             if w is not None and w.isRunning():
@@ -2636,12 +2713,15 @@ class ProjectTab(QWidget):
             QMessageBox.information(self, "Git", "当前项目不是 git 仓库")
             return
         if self._git_viewer is not None:
+            self._request_git_refresh()
+            self._git_viewer._reload(force=True)
             self._git_viewer.show()
             self._git_viewer.raise_()
             self._git_viewer.activateWindow()
             return
         dlg = GitViewer(self.project_meta.path, parent=self)
         self._git_viewer = dlg
+        dlg.statusUpdated.connect(self._on_git_snapshot_ready)
         dlg.destroyed.connect(lambda: setattr(self, "_git_viewer", None))
         dlg.openFileRequested.connect(lambda p: self._show_preview(p, 0, 0))
         dlg.show()

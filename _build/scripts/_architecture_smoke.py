@@ -184,7 +184,7 @@ def tree_and_git_check():
     preview = _bounded_diff_preview(large)
     assert len(preview) < 201_000 and len(preview.splitlines()) < 2_010
     assert "仅显示前部" in preview and "复制" in preview
-    with patch.object(git_ops, "repo_root", lambda p: p), patch.object(git_ops, "current_branch", lambda p: "main"), patch.object(git_ops, "list_changed_files", lambda p: []), patch.object(git_ops, "diff_numstat", lambda p: {}):
+    with patch.object(git_ops, "repo_root", lambda p: p), patch.object(git_ops, "current_branch", lambda p: "main"), patch.object(git_ops, "list_changed_files", lambda p, **kwargs: []), patch.object(git_ops, "diff_numstat", lambda p: {}):
         viewer = GitViewer(str(root))
         wait_until(lambda: not viewer._active_workers)
         viewer._refresh_timer.stop()

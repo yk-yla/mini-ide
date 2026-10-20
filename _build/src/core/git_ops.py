@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,15 @@ class ChangedFile:
     path: str            # 相对仓库根
     is_staged: bool      # 是否已进入 staged
     is_unstaged: bool    # 是否有工作区改动
+
+
+@dataclass(frozen=True)
+class GitStatusSnapshot:
+    started_ns: int
+    branch: str
+    files: list[ChangedFile]
+    statuses: dict[str, str]
+    deleted_by_parent: dict[str, list[str]]
 
 
 def _run(args: list[str], cwd: str, timeout: int = 10) -> tuple[int, str, str]:
@@ -55,10 +65,12 @@ def repo_root(path: str) -> str:
     return out.strip().replace("/", "\\") if sys.platform == "win32" else out.strip()
 
 
-def list_changed_files(cwd: str) -> list[ChangedFile]:
+def list_changed_files(cwd: str, *, strict: bool = False) -> list[ChangedFile]:
     """等价于 git status --porcelain，分清楚 staged / unstaged"""
-    rc, out, _ = _run(["status", "--porcelain=v1"], cwd)
+    rc, out, error = _run(["status", "--porcelain=v1"], cwd)
     if rc != 0:
+        if strict:
+            raise RuntimeError(error.strip() or "git status failed")
         return []
     results: list[ChangedFile] = []
     for raw in out.splitlines():
@@ -80,6 +92,16 @@ def list_changed_files(cwd: str) -> list[ChangedFile]:
             is_unstaged=unstaged_flag not in (" ",),
         ))
     return results
+
+
+def read_status_snapshot(cwd: str) -> GitStatusSnapshot:
+    """先读取本地状态；忽略文件和上游统计不阻塞这份结果。"""
+    started_ns = time.monotonic_ns()
+    files = list_changed_files(cwd, strict=True)
+    return GitStatusSnapshot(
+        started_ns, current_branch(cwd), files,
+        file_status_map(cwd, files=files), list_deleted_paths(cwd, files=files),
+    )
 
 
 # 文件 git 状态枚举（给 file_tree 染色用）

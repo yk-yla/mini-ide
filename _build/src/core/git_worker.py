@@ -142,18 +142,10 @@ class GitMergePushWorker(BackgroundThread):
 
 
 class GitStatusWorker(BackgroundThread):
-    """后台拉 git status / ignored / deleted + 分支信息，给文件树染色和状态栏用。
+    """只读取本地状态，慢查询由独立任务补充，不占用下一轮刷新。"""
 
-    主线程跑这些命令在大仓库上 200ms~1s+，每 3s 跑一次会让目录树滚动很卡。
-    打包成一个 worker 后台跑，结果信号一次性回主线程刷颜色和状态栏分支/改动数。
-
-    info 用 object 承载 GitInfo | None（非 git 仓库为 None），让状态栏的
-    分支按钮、改动数按钮也由后台数据驱动，主线程不再同步调 git。
-
-    done(statuses, ignored, deleted_by_parent, info)
-    """
-
-    done = Signal(dict, set, dict, object)
+    done = Signal(object)
+    failed = Signal(object, str)
 
     def __init__(self, cwd: str, parent=None):
         super().__init__(parent)
@@ -161,23 +153,41 @@ class GitStatusWorker(BackgroundThread):
 
     def run(self) -> None:
         started = time.perf_counter()
-        from src.core.git_ops import (
-            file_status_map, list_changed_files, list_deleted_paths,
-            list_ignored_files,
-        )
+        started_ns = time.monotonic_ns()
+        from src.core.git_ops import read_status_snapshot
+        try:
+            snapshot = read_status_snapshot(self.cwd)
+            if self.isInterruptionRequested():
+                return
+            self.done.emit(snapshot)
+            perf_log.info(
+                "perf op=git-status-worker duration_ms=%.1f files=%d status=done",
+                (time.perf_counter() - started) * 1000, len(snapshot.files),
+            )
+        except Exception as error:
+            perf_log.exception("Git 状态刷新失败: %s", self.cwd)
+            self.failed.emit(started_ns, str(error))
+
+
+class GitStatusDetailsWorker(BackgroundThread):
+    """补充忽略文件、上游提交数；每个项目最多一轮。"""
+
+    done = Signal(object, set, object)
+
+    def __init__(self, cwd: str, snapshot, parent=None):
+        super().__init__(parent)
+        self.cwd = cwd
+        self.snapshot = snapshot
+
+    def run(self) -> None:
+        from src.core.git_ops import list_ignored_files
         from src.util import git_info
-        # 一轮刷新里 file_status_map 和 list_deleted_paths 都基于 git status
-        # --porcelain，过去各自跑一次（每次 Windows 上 spawn 30-80ms）。这里只
-        # 查一次再喂给两个解析函数，省掉一次重复的 git 子进程。
-        changed = list_changed_files(self.cwd)
-        statuses = file_status_map(self.cwd, files=changed)
-        ignored = list_ignored_files(self.cwd)
-        deleted = list_deleted_paths(self.cwd, files=changed)
-        # 状态栏改动数必须复用本轮新查到的 git status 结果，避免短缓存让
-        # 外层显示"有改动"而 GitViewer 重新查询后显示干净。
-        info = git_info.get_info(self.cwd, changed_count=len(changed))
-        perf_log.info(
-            "perf op=git-status-worker duration_ms=%.1f files=%d status=done",
-            (time.perf_counter() - started) * 1000, len(changed),
-        )
-        self.done.emit(statuses, ignored, deleted, info)
+
+        try:
+            ignored = list_ignored_files(self.cwd)
+            if self.isInterruptionRequested():
+                return
+            info = git_info.get_info(self.cwd, changed_count=len(self.snapshot.files))
+            self.done.emit(self.snapshot, ignored, info)
+        except Exception:
+            perf_log.exception("Git 补充信息刷新失败: %s", self.cwd)

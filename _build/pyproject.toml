@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "mini-ide"
-version = "0.1.1"
+version = "0.1.2"
 description = "AI 时代的开发指挥台 - Spring Boot / Vue / Python 项目轻量 IDE"
 authors = ["yxbkjh <yxbkjh@gmail.com>"]
 package-mode = false

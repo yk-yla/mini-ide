@@ -342,7 +342,7 @@ def main() -> int:
 
             git_ops.repo_root = slow_repo_root
             git_ops.current_branch = lambda _root: "main"
-            git_ops.list_changed_files = lambda _root: []
+            git_ops.list_changed_files = lambda _root, **kwargs: []
             git_ops.diff_numstat = lambda _root: {}
             started = time.perf_counter()
             viewer = GitViewer(tmp)
