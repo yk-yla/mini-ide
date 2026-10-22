@@ -14,7 +14,10 @@ from pathlib import Path
 from src.util.git_executable import resolve_git_executable
 
 _CACHE: dict[str, tuple[float, "GitInfo | None"]] = {}
-_TTL = 2.0    # 秒，状态栏每 3s 刷一次；短缓存保证 AI 提交后改动数及时归零
+# 秒。必须大于状态栏轮询间隔 STATUS_REFRESH_MS(3s)，否则每轮进来缓存都已过期，
+# 每 3s 会白跑 rev-parse + rev-list 两个 git 子进程。写 5s 留出余量。
+# 分支切换、提交、合并等动作会调 invalidate() 立即失效，不依赖 TTL 兜底。
+_TTL = 5.0
 
 # Windows：防止 GUI 程序调 subprocess 时弹黑框
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
@@ -39,10 +42,27 @@ def _git(args: list[str], cwd: str) -> str:
 
 
 def get_info(project_path: str, changed_count: int | None = None) -> GitInfo | None:
+    """读取分支/改动/ahead-behind。
+
+    缓存只保存"贵且变得慢"的部分（branch、ahead、behind）。changed_count 由调用方
+    从刚查好的快照传入时，直接采用传入值——它比缓存新，不必为它再跑 git status。
+    这样传 changed_count 时也能命中缓存，不再是"传了参数就必然重新查 git"。
+    """
     now = time.time()
     cached = _CACHE.get(project_path)
-    if changed_count is None and cached and now - cached[0] < _TTL:
-        return cached[1]
+    fresh = cached is not None and now - cached[0] < _TTL
+
+    if fresh:
+        base = cached[1]
+        if changed_count is None:
+            return base
+        # 复用缓存里的分支与 ahead/behind，改动数用调用方给的新值
+        if base is None:
+            return None
+        return GitInfo(
+            branch=base.branch, dirty=changed_count > 0,
+            ahead=base.ahead, behind=base.behind, changed=changed_count,
+        )
 
     root = Path(project_path)
     if not (root / ".git").exists():
@@ -74,6 +94,7 @@ def get_info(project_path: str, changed_count: int | None = None) -> GitInfo | N
                     behind, ahead = int(parts[0]), int(parts[1])
         except (subprocess.SubprocessError, ValueError):
             pass
+        # 缓存里存 checked=0 的版本，changed 交给每次调用方决定
         info: GitInfo | None = GitInfo(
             branch=branch, dirty=dirty, ahead=ahead, behind=behind, changed=changed,
         )

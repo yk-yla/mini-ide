@@ -46,7 +46,7 @@ from src.ui.theme import apply_theme
 from src.core.config import AppConfig
 
 
-SERVER_NAME = "mini-ide-single-instance"
+from src.core.cli_contract import SERVER_NAME
 _INSTANCE_LOCK: QLockFile | None = None
 
 
@@ -55,7 +55,11 @@ def _instance_lock_path() -> str:
     temp_dir = QStandardPaths.writableLocation(QStandardPaths.TempLocation)
     if not temp_dir:
         temp_dir = str(Path.cwd())
-    return str(Path(temp_dir) / "whaty-mini-ide-single-instance.lock")
+    suffix = ""
+    if SERVER_NAME != "mini-ide-single-instance":
+        import hashlib
+        suffix = "-" + hashlib.sha256(SERVER_NAME.encode()).hexdigest()[:16]
+    return str(Path(temp_dir) / f"whaty-mini-ide-single-instance{suffix}.lock")
 
 
 def _acquire_instance_lock() -> QLockFile | None:

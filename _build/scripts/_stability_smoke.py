@@ -126,6 +126,7 @@ def aggregate_close_checks(app):
     QWidget.__init__(tab)
     tab._project_tabs = {}
     tab._refresh_timer = QTimer(tab)
+    tab._create_poll_timer = QTimer(tab)
     for name in ("_save_worker", "_create_worker", "_merge_worker", "_sync_push_worker",
                  "_delete_worker", "_prepare_worker", "_delete_preflight_worker"):
         setattr(tab, name, None)

@@ -66,6 +66,29 @@ def _ancestors(path: Path) -> tuple[Path, ...]:
     return (path, *path.parents)
 
 
+def _normal_target(requested: str, path: Path, boundary: Path | None = None) -> ResolvedTarget:
+    # 最近的项目标记（包括嵌套仓库）就是边界，不跨越聚合根寻找普通项目。
+    markers = (
+        "build.gradle", "build.gradle.kts", "pom.xml", "package.json",
+        "pyproject.toml", "requirements.txt", "manage.py", "go.mod",
+        ".mini-ide/runtime.json",
+    )
+    project = path
+    for root in _ancestors(path):
+        if root == boundary:
+            break
+        if ((root / ".git").exists()
+                or any((root / marker).is_file() for marker in markers)
+                or ((root / "nginx.exe").is_file() and (
+                    (root / "nginx.conf").is_file() or (root / "conf/nginx.conf").is_file()))):
+            project = root
+            break
+    return ResolvedTarget(
+        requested_path=requested, path=str(path), kind="normal_project",
+        open_command="open", open_target=str(project), project_target=str(project),
+    )
+
+
 def _workspace_component(
     path: Path,
     workspace: DevelopmentWorkspace,
@@ -157,7 +180,7 @@ def resolve_target_path(
     path: str | Path,
     registered_aggregate_paths: Iterable[str | Path] = (),
 ) -> ResolvedTarget:
-    """解析任意目录；组件内更深层目录仍归属于同一个聚合/工作区。"""
+    """优先解析工作区/聚合归属；普通目录向上找到最近的项目边界。"""
     requested = str(path)
     target = canonical_path(path)
     if not target.is_dir():
@@ -179,7 +202,7 @@ def resolve_target_path(
             kind=kind,
             open_command="open-workspace",
             open_target=workspace.root_path,
-            project_target=component_id,
+            project_target=component_path,
             aggregate_project=aggregate,
             development_workspace=workspace,
             component_id=component_id,
@@ -204,32 +227,18 @@ def resolve_target_path(
             component_id = component_name = component_path = ""
             kind = "aggregate"
             if normalized_path_key(target) != normalized_path_key(aggregate.root_path):
-                return ResolvedTarget(
-                    requested_path=requested,
-                    path=str(target),
-                    kind="normal_project",
-                    open_command="open",
-                    open_target=str(target),
-                    project_target=str(target),
-                )
+                return _normal_target(requested, target, boundary=root)
         return ResolvedTarget(
             requested_path=requested,
             path=str(target),
             kind=kind,
             open_command="open-aggregate",
             open_target=aggregate.root_path,
-            project_target=component_id,
+            project_target=component_path,
             aggregate_project=aggregate,
             component_id=component_id,
             component_name=component_name,
             component_path=component_path,
         )
 
-    return ResolvedTarget(
-        requested_path=requested,
-        path=str(target),
-        kind="normal_project",
-        open_command="open",
-        open_target=str(target),
-        project_target=str(target),
-    )
+    return _normal_target(requested, target)

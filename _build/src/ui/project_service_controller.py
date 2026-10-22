@@ -590,6 +590,19 @@ class ProjectServiceController:
             "profile": compile_prof,
         }
 
+    def prepare_action(self, action: str) -> dict:
+        from src.core.project_inspection import ACTION_KINDS
+        profile = next((item for item in self.tab.project_meta.profiles if item.name == action), None)
+        if profile is None:
+            return {"ok": False, "code": "action_not_found", "error": f"configured action not found: {action}"}
+        if profile.kind not in ACTION_KINDS:
+            return {"ok": False, "code": "unsupported_action", "error": "service profiles use start/ensure-running; run-action only accepts build/test/install/clean"}
+        conflict = self.build_start_error()
+        if conflict:
+            return conflict
+        self._compile_reserved = True
+        return {"ok": True, "runner": self.tab.runner, "profile": profile}
+
     def start_prepared_compile(self, prepared: dict) -> dict:
         if not self._compile_reserved:
             return {"ok": False, "error": "compile reservation is no longer valid"}

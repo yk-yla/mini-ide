@@ -24,15 +24,14 @@ from src.core.aggregate_workspace import (
 from src.core.aggregate_workspace_manager import build_workspace_dashboard_snapshot
 from src.core.config import AppConfig, ProjectEntry
 from src.core.development_workspace_service import (
-    create_development_workspace, delete_development_workspace,
-    inspect_workspace_delete, merge_development_workspace,
-    sync_commit_and_push_development_workspace,
+    WorkspaceCreationResult,
+    create_development_workspace,
 )
 from src.core.git_ops import current_branch
 from src.core.path_utils import normalized_path_key
 from src.core.project_detector import detect_project
 from src.core.service_state import (
-    STATE_RUNNING_EXTERNAL, STATE_STARTING, STATE_STOPPING, STATE_UNKNOWN,
+    EnvironmentSwitchBlocked, STATE_RUNNING_EXTERNAL, STATE_STARTING, STATE_STOPPING, STATE_UNKNOWN,
 )
 from src.core.tool_launchers import (
     CREATE_NO_WINDOW, open_in_cc_args, open_in_codex_args,
@@ -102,101 +101,26 @@ class _WorkspaceSnapshotWorker(BackgroundThread):
 
 
 class _CreateWorkspaceWorker(BackgroundThread):
-    done = Signal(object)
-
     def __init__(self, plan, parent=None):
         super().__init__(parent)
         self.plan = plan
+        self.result = None
+        self.error = ""
+        self.completed = False
+        self.progress = (0, 1, "准备创建工作区")
 
-    def run(self) -> None:
-        self.done.emit(create_development_workspace(self.plan))
-
-
-class _MergeWorkspaceWorker(BackgroundThread):
-    done = Signal(object, str)
-
-    def __init__(self, workspace: DevelopmentWorkspace, parent=None):
-        super().__init__(parent)
-        self.workspace = workspace
+    def _report_progress(self, current: int, total: int, message: str) -> None:
+        self.progress = (current, total, message)
+        action_log.info("[GUI] 创建工作区进度 step=%d/%d item=%s", current, total, message)
 
     def run(self) -> None:
         try:
-            self.done.emit(merge_development_workspace(self.workspace), "")
+            self.result = create_development_workspace(self.plan, progress=self._report_progress)
         except Exception as exc:
-            self.done.emit(None, str(exc))
-
-
-class _SyncPushWorkspaceWorker(BackgroundThread):
-    done = Signal(object, str)
-
-    def __init__(
-        self,
-        workspace: DevelopmentWorkspace,
-        message: str,
-        *,
-        keep_conflicts: bool,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.workspace = workspace
-        self.message = message
-        self.keep_conflicts = keep_conflicts
-
-    def run(self) -> None:
-        try:
-            self.done.emit(
-                sync_commit_and_push_development_workspace(
-                    self.workspace,
-                    self.message,
-                    keep_conflicts=self.keep_conflicts,
-                ),
-                "",
-            )
-        except Exception as exc:
-            self.done.emit(None, str(exc))
-
-
-class _DeletePreflightWorker(BackgroundThread):
-    done = Signal(object, str)
-
-    def __init__(
-        self, workspace: DevelopmentWorkspace, running_paths: tuple[str, ...], parent=None,
-    ):
-        super().__init__(parent)
-        self.workspace = workspace
-        self.running_paths = running_paths
-
-    def run(self) -> None:
-        try:
-            self.done.emit(
-                inspect_workspace_delete(self.workspace, self.running_paths), "",
-            )
-        except Exception as exc:
-            self.done.emit(None, str(exc))
-
-
-class _DeleteWorkspaceWorker(BackgroundThread):
-    done = Signal(bool, object, str)
-
-    def __init__(self, plan, confirm_unmerged: bool, parent=None):
-        super().__init__(parent)
-        self.plan = plan
-        self.confirm_unmerged = confirm_unmerged
-
-    def run(self) -> None:
-        action_log.info("[GUI] 开始删除工作区 workspace=%s", self.plan.workspace.root_path)
-        try:
-            ok, kept, error = delete_development_workspace(
-                self.plan, confirm_unmerged_backed_up=self.confirm_unmerged,
-            )
-        except Exception as exc:
-            action_log.exception("[GUI] 删除工作区异常 workspace=%s", self.plan.workspace.root_path)
-            ok, kept, error = False, (), f"删除未完成：{exc}"
-        action_log.info(
-            "[GUI] 工作区清理结果 workspace=%s ok=%s remaining=%s error=%s",
-            self.plan.workspace.root_path, ok, kept, error,
-        )
-        self.done.emit(ok, kept, error)
+            self.error = str(exc)
+            action_log.exception("[GUI] 创建工作区后台任务异常")
+        finally:
+            self.completed = True
 
 
 class _WorkspaceCard(QFrame):
@@ -280,11 +204,6 @@ class _WorkspaceCard(QFrame):
         actions = QHBoxLayout()
         actions.addStretch(1)
         self._add_button(actions, "进入工作区", "activate", primary=True)
-        self._add_button(actions, "同步并推送", "sync-push")
-        self._add_button(actions, "合并代码", "merge")
-        self._add_button(actions, "在 codex 中打开", "codex")
-        self._add_button(actions, "在 cc 中打开", "cc")
-        self._add_button(actions, "删除工作区", "delete", danger=True)
         root.addLayout(actions)
 
     def _add_status(self, layout, text: str, tone: str) -> None:
@@ -372,10 +291,10 @@ class AggregateProjectTab(QWidget):
         self._save_worker: _SaveProjectWorker | None = None
         self._workspace_worker: _WorkspaceSnapshotWorker | None = None
         self._create_worker: _CreateWorkspaceWorker | None = None
-        self._merge_worker: _MergeWorkspaceWorker | None = None
-        self._sync_push_worker: _SyncPushWorkspaceWorker | None = None
-        self._delete_preflight_worker: _DeletePreflightWorker | None = None
-        self._delete_worker: _DeleteWorkspaceWorker | None = None
+        self._create_started = 0.0
+        self._create_poll_timer = QTimer(self)
+        self._create_poll_timer.setInterval(100)
+        self._create_poll_timer.timeout.connect(self._poll_workspace_creation)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(GAP_MD, GAP_MD, GAP_MD, GAP_MD)
@@ -768,7 +687,10 @@ class AggregateProjectTab(QWidget):
         running = self.running_service_items(refresh_external=True)
         if running:
             if not interactive:
-                return False
+                raise EnvironmentSwitchBlocked(
+                    running, old_path or self.aggregate_root_path,
+                    new_path or self.aggregate_root_path,
+                )
             answer = QMessageBox.question(
                 self,
                 "切换代码目录",
@@ -808,9 +730,7 @@ class AggregateProjectTab(QWidget):
 
     def _workspace_busy(self) -> bool:
         return bool(
-            self._workspace_worker or self._create_worker or self._merge_worker
-            or self._sync_push_worker or self._delete_preflight_worker
-            or self._delete_worker
+            self._workspace_worker or self._create_worker
         )
 
     def _update_workspace_buttons(self) -> None:
@@ -887,11 +807,6 @@ class AggregateProjectTab(QWidget):
         self._select_workspace_card(summary)
         handlers = {
             "activate": self._activate_selected_workspace,
-            "codex": self._open_selected_in_codex,
-            "cc": self._open_selected_in_cc,
-            "sync-push": self._sync_push_selected_workspace,
-            "merge": self._merge_selected_workspace,
-            "delete": self._delete_selected_workspace,
         }
         handler = handlers.get(action)
         if handler:
@@ -916,15 +831,34 @@ class AggregateProjectTab(QWidget):
         self.workspace_status.setText("正在创建所选项目的 Worktree...")
         worker = _CreateWorkspaceWorker(plan, QApplication.instance())
         self._create_worker = worker
+        self._create_started = time.monotonic()
         self._update_workspace_buttons()
-        worker.done.connect(self._workspace_created)
         worker.finished.connect(worker.deleteLater)
-        worker.start()
+        self._create_poll_timer.start()
+        try:
+            worker.start()
+        except Exception as exc:
+            worker.error = str(exc)
+            worker.completed = True
+            worker.deleteLater()
+
+    def _poll_workspace_creation(self) -> None:
+        worker = self._create_worker
+        if worker is None:
+            self._create_poll_timer.stop()
+            return
+        current, total, message = worker.progress
+        elapsed = time.monotonic() - self._create_started
+        self.workspace_status.setText(f"{message}（{current}/{total}） · 已用 {elapsed:.1f} 秒")
+        if worker.completed:
+            result = worker.result or WorkspaceCreationResult(
+                False, None, (), (), (), worker.error or "后台创建已结束，但未返回结果，请检查后重试。",
+            )
+            self._workspace_created(result)
 
     def _workspace_created(self, result) -> None:
-        if self.sender() is not self._create_worker:
-            return
         self._create_worker = None
+        self._create_poll_timer.stop()
         if not result.ok or result.workspace is None:
             action_log.warning("[GUI] 创建工作区失败 error=%s", result.error)
             details = [result.error]
@@ -934,11 +868,16 @@ class AggregateProjectTab(QWidget):
                 details.append("已安全回滚：" + ", ".join(result.rolled_back_components))
             if result.pending_components:
                 details.append("未处理：" + ", ".join(result.pending_components))
+            if result.pushed_components:
+                details.append("已推送任务分支：" + ", ".join(result.pushed_components))
+            if result.workspace is not None:
+                details.append("保留的本地工作区：" + result.workspace.root_path)
+                self._pending_workspace_path = result.workspace.root_path
             QMessageBox.warning(self, "创建需求工作区失败", "\n".join(details))
         else:
             action_log.info("[GUI] 创建工作区成功 workspace=%s", result.workspace.root_path)
             self._pending_workspace_path = result.workspace.root_path
-            self.workspace_status.setText("需求工作区已创建。")
+            self.workspace_status.setText("需求工作区已创建，任务分支已推送远程。")
         self._update_workspace_buttons()
         self.refresh_workspaces()
 
@@ -970,349 +909,6 @@ class AggregateProjectTab(QWidget):
     def _open_current_in_cc(self) -> None:
         target = self._current_environment_root()
         self._open_external_tool(target, open_in_cc_args(target))
-
-    def _open_selected_in_codex(self) -> None:
-        summary = self._selected_workspace_summary()
-        if summary and summary.workspace is not None:
-            target = Path(summary.workspace.root_path)
-            self._open_external_tool(target, open_in_codex_args(target), "open gpt")
-
-    def _open_selected_in_cc(self) -> None:
-        summary = self._selected_workspace_summary()
-        if summary and summary.workspace is not None:
-            target = Path(summary.workspace.root_path)
-            self._open_external_tool(target, open_in_cc_args(target))
-
-    def _sync_push_selected_workspace(self) -> None:
-        summary = self._selected_workspace_summary()
-        if not summary or summary.workspace is None or self._workspace_busy():
-            return
-        editable = [
-            item for item in summary.workspace.components if item.mode == "worktree"
-        ]
-        commit_message = summary.workspace.name.strip() or summary.workspace.id
-        lines = ["将同步并推送以下任务分支："]
-        lines.extend(
-            f"- {item.id}: {item.base_branch} -> {item.task_branch}"
-            for item in editable
-        )
-        lines.append(
-            f"\n将先用“{commit_message}”提交工作区本地改动（暂不推送），"
-            "再从远端获取源分支更新并合并进任务分支；"
-            "全部同步成功后才推送到 origin。"
-            "同步冲突会回滚合并并停止推送，本地提交会保留。确认继续？"
-        )
-        box = QMessageBox(self)
-        box.setWindowTitle("确认同步并推送")
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setText("\n".join(lines))
-        box.setStandardButtons(
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        box.setDefaultButton(QMessageBox.StandardButton.No)
-        box.exec()
-        if box.standardButton(box.clickedButton()) != QMessageBox.StandardButton.Yes:
-            return
-        self._start_workspace_sync_push(
-            summary.workspace,
-            commit_message,
-            keep_conflicts=False,
-        )
-
-    def _start_workspace_sync_push(
-        self,
-        workspace: DevelopmentWorkspace,
-        commit_message: str,
-        *,
-        keep_conflicts: bool,
-    ) -> None:
-        action_log.info(
-            "[GUI] 同步并推送工作区 aggregate=%s workspace=%s "
-            "fetch_remote=true keep_conflicts=%s",
-            self.aggregate_project.name, workspace.name, keep_conflicts,
-        )
-        self.workspace_status.setText("正在提交本地改动、同步源分支并推送...")
-        worker = _SyncPushWorkspaceWorker(
-            workspace,
-            commit_message,
-            keep_conflicts=keep_conflicts,
-            parent=QApplication.instance(),
-        )
-        self._sync_push_worker = worker
-        self._update_workspace_buttons()
-        worker.done.connect(self._workspace_sync_push_ready)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
-
-    @staticmethod
-    def _conflict_lines(items) -> list[str]:
-        lines = []
-        for item in items:
-            files = "、".join(item.conflict_files[:5])
-            if len(item.conflict_files) > 5:
-                files += f" 等 {len(item.conflict_files)} 个文件"
-            lines.append(f"- {item.id}: {files or '有冲突'}")
-        return lines
-
-    def _workspace_sync_push_ready(self, result, error: str) -> None:
-        if self.sender() is not self._sync_push_worker:
-            return
-        self._sync_push_worker = None
-        self._update_workspace_buttons()
-        if error or result is None:
-            message = error or "未知错误"
-            action_log.warning("[GUI] 同步并推送工作区失败 error=%s", message)
-            QMessageBox.warning(self, "同步并推送失败", message)
-            self.refresh_workspaces()
-            return
-
-        committed = [item.id for item in result.components if item.committed]
-        synced = [item.id for item in result.components if item.synced]
-        current = [item.id for item in result.components if item.already_current]
-        pushed = [item.id for item in result.components if item.pushed]
-        others = [
-            f"- {item.id}: {item.error}"
-            for item in result.components
-            if item.error and not item.conflicted
-        ]
-        if result.needs_conflict_confirmation:
-            conflicted = [
-                item for item in result.components
-                if item.conflicted and item.rolled_back
-            ]
-            lines = ["以下项目同步时有冲突，已回滚到同步前状态："]
-            lines.extend(self._conflict_lines(conflicted))
-            if synced:
-                lines.append(f"\n已成功同步：{'、'.join(synced)}")
-            if committed:
-                lines.append(f"\n已保留本地提交：{'、'.join(committed)}")
-            if others:
-                lines.append("\n其它未同步项目：")
-                lines.extend(others)
-            lines.append(
-                "\n本次没有推送。是否重新同步并把冲突保留在工作区，"
-                "由你或 AI 手工解决？"
-                "\n解决冲突后再次点击“同步并推送”即可完成提交和推送。"
-            )
-            answer = QMessageBox.question(
-                self, "同步并推送存在冲突", "\n".join(lines),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer == QMessageBox.StandardButton.Yes:
-                commit_message = result.workspace.name.strip() or result.workspace.id
-                self._start_workspace_sync_push(
-                    result.workspace,
-                    commit_message,
-                    keep_conflicts=True,
-                )
-                return
-            action_log.warning(
-                "[GUI] 同步并推送存在冲突并已回滚 projects=%s",
-                "、".join(item.id for item in conflicted),
-            )
-            self.workspace_status.setText("同步存在冲突，已回滚且未推送。")
-            self.refresh_workspaces()
-            return
-
-        if not result.ok:
-            kept = [
-                item for item in result.components
-                if item.conflicted and not item.rolled_back
-            ]
-            blocks = []
-            if committed:
-                blocks.append("已保留本地提交：" + "、".join(committed))
-            if synced:
-                blocks.append("已同步：" + "、".join(synced))
-            if kept:
-                blocks.append(
-                    "冲突已保留，尚未推送：\n"
-                    + "\n".join(self._conflict_lines(kept))
-                )
-            if pushed:
-                blocks.append("已推送：" + "、".join(pushed))
-            if others:
-                blocks.append("未完成项目：\n" + "\n".join(others))
-            if result.error and not kept:
-                blocks.append(result.error)
-            action_log.warning("[GUI] 同步并推送未完成 error=%s", result.error)
-            QMessageBox.warning(
-                self, "同步并推送未完成", "\n\n".join(blocks) or result.error,
-            )
-            self.refresh_workspaces()
-            return
-
-        blocks = []
-        if committed:
-            blocks.append("已提交本地改动：" + "、".join(committed))
-        if synced:
-            blocks.append("已同步源分支：" + "、".join(synced))
-        if current:
-            blocks.append("已是最新：" + "、".join(current))
-        blocks.append("已推送：" + "、".join(pushed))
-        action_log.info(
-            "[GUI] 同步并推送工作区成功 synced=%s pushed=%s",
-            "、".join(synced) or "无", "、".join(pushed) or "无",
-        )
-        QMessageBox.information(
-            self, "同步并推送完成", "\n\n".join(blocks),
-        )
-        self.refresh_workspaces()
-
-    def _merge_selected_workspace(self) -> None:
-        summary = self._selected_workspace_summary()
-        if not summary or summary.workspace is None or self._workspace_busy():
-            return
-        editable = [
-            item for item in summary.workspace.components if item.mode == "worktree"
-        ]
-        lines = ["将把以下任务分支快进合并到基准分支，并推送基准分支上游："]
-        lines.extend(
-            f"- {item.id}: {item.task_branch} -> {item.base_branch}"
-            for item in editable
-        )
-        commit_message = summary.workspace.name.strip() or summary.workspace.id
-        lines.append(
-            f"\n将先自动提交各工作区的全部改动，提交信息为“{commit_message}”，"
-            "再合并到基准分支并推送。源目录必须无未提交改动，"
-            "分支分叉时不会自动合并；基准分支上已有的未推送提交也会一并推送。"
-            "确认继续？"
-        )
-        answer = QMessageBox.question(
-            self,
-            "确认合并代码",
-            "\n".join(lines),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        self.workspace_status.setText("正在提交、合并并推送代码...")
-        worker = _MergeWorkspaceWorker(summary.workspace, QApplication.instance())
-        self._merge_worker = worker
-        self._update_workspace_buttons()
-        worker.done.connect(self._workspace_merge_ready)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
-
-    def _workspace_merge_ready(self, result, error: str) -> None:
-        if self.sender() is not self._merge_worker:
-            return
-        self._merge_worker = None
-        self._update_workspace_buttons()
-        if error or result is None or not result.ok:
-            message = error or (result.error if result is not None else "未知错误")
-            if result is not None and result.components:
-                details = [
-                    f"- {item.id}: {item.error}"
-                    for item in result.components if item.error
-                ]
-                pushed = [item.id for item in result.components if item.pushed]
-                if pushed:
-                    details.insert(0, "已推送基准分支：" + "、".join(pushed))
-                if details:
-                    message = message + "\n\n" + "\n".join(details)
-            action_log.warning("[GUI] 合并工作区失败 error=%s", message)
-            QMessageBox.warning(self, "合并并推送失败", message)
-        else:
-            projects = "、".join(item.id for item in result.components if item.merged)
-            action_log.info("[GUI] 合并并推送工作区成功 projects=%s", projects)
-            QMessageBox.information(
-                self, "合并并推送完成",
-                f"已合并并推送基准分支：{projects}",
-            )
-        self.refresh_workspaces()
-
-    def _running_project_paths(self) -> tuple[str, ...]:
-        paths = []
-        for tab in self._project_tabs.values():
-            if tab.running_service_items(refresh_external=True):
-                paths.append(tab.project_meta.path)
-        return tuple(paths)
-
-    def _delete_selected_workspace(self) -> None:
-        summary = self._selected_workspace_summary()
-        if not summary or summary.workspace is None or self._workspace_busy():
-            return
-        self.workspace_status.setText("正在执行删除预检...")
-        worker = _DeletePreflightWorker(
-            summary.workspace, self._running_project_paths(), QApplication.instance(),
-        )
-        self._delete_preflight_worker = worker
-        self._update_workspace_buttons()
-        worker.done.connect(self._delete_preflight_ready)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
-
-    def _delete_preflight_ready(self, plan, error: str) -> None:
-        if self.sender() is not self._delete_preflight_worker:
-            return
-        self._delete_preflight_worker = None
-        self._update_workspace_buttons()
-        if error or plan is None:
-            QMessageBox.warning(self, "删除预检失败", error or "未知错误")
-            self.refresh_workspaces()
-            return
-        if plan.blockers:
-            details = "\n".join(f"- {item}" for item in plan.blockers)
-            QMessageBox.warning(self, "当前不能删除", details)
-            self.refresh_workspaces()
-            return
-        lines = ["已确认以下项目的任务分支已合并，基准分支已推送远程："]
-        for item in plan.components:
-            lines.append(
-                f"- {item.id}: {item.task_branch} → {item.base_branch} "
-                f"→ {item.base_remote_ref}"
-            )
-        lines.extend([
-            "",
-            "继续后将分别清理以下内容，一项失败不阻止其他项：",
-            f"1. 递归删除整个工作区目录：{plan.workspace.root_path}",
-            "2. 删除为该工作区创建的本地任务分支",
-            "3. 删除远程仓库中的同名任务分支",
-            "",
-            "目录内所有文件都会删除且无法恢复。确认继续？",
-        ])
-        answer = QMessageBox.question(
-            self,
-            "确认删除需求工作区",
-            "\n".join(lines),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            self.refresh_workspaces()
-            return
-        if self.workspace and normalized_path_key(self.workspace.root_path) == normalized_path_key(
-            plan.workspace.root_path
-        ):
-            if not self.activate_workspace(None):
-                QMessageBox.warning(self, "删除已取消", "当前工作区未能安全退出。")
-                return
-        worker = _DeleteWorkspaceWorker(
-            plan, plan.needs_unmerged_confirmation, QApplication.instance(),
-        )
-        self._delete_worker = worker
-        self._update_workspace_buttons()
-        self.workspace_status.setText("正在删除工作区目录和任务分支...")
-        worker.done.connect(self._workspace_deleted)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
-
-    def _workspace_deleted(self, ok: bool, kept_branches, error: str) -> None:
-        if self.sender() is not self._delete_worker:
-            return
-        self._delete_worker = None
-        self._update_workspace_buttons()
-        if not ok:
-            action_log.warning("[GUI] 删除工作区失败 error=%s", error)
-            QMessageBox.warning(self, "删除未完成", error)
-        else:
-            action_log.info("[GUI] 删除工作区成功 kept_branches=%s", kept_branches)
-            message = "需求工作区目录、本地任务分支和远程任务分支均已删除。"
-            QMessageBox.information(self, "删除完成", message)
-        self.refresh_workspaces()
 
     def edit_project_definition(self) -> None:
         if self._save_worker or self._prepare_worker:
@@ -1462,8 +1058,9 @@ class AggregateProjectTab(QWidget):
 
     def running_service_items(self, refresh_external: bool = True) -> list[dict]:
         return [
-            item.to_running_item()
-            for item in self.service_states(refresh_external)
+            {**item.to_running_item(), "project_path": tab.project_meta.path}
+            for tab in self._project_tabs.values()
+            for item in tab.service_states(refresh_external=refresh_external)
             if item.is_active
         ]
 
@@ -1490,10 +1087,13 @@ class AggregateProjectTab(QWidget):
         # Writes must finish before their workbench is closed. Queries can finish
         # under the application owner without blocking the GUI.
         for worker in (
-            self._save_worker, self._create_worker, self._merge_worker,
-            self._sync_push_worker, self._delete_worker,
+            self._save_worker, self._create_worker,
         ):
-            if worker and worker.isRunning():
+            try:
+                writing = worker is not None and worker.isRunning()
+            except RuntimeError:
+                writing = False
+            if writing:
                 if not quiet:
                     QMessageBox.information(self, "任务进行中", "工作区正在写入或同步，请完成后再关闭。")
                 return False
@@ -1514,7 +1114,8 @@ class AggregateProjectTab(QWidget):
             ):
                 return False
         self._refresh_timer.stop()
-        for worker in (self._prepare_worker, self._workspace_worker, self._delete_preflight_worker):
+        self._create_poll_timer.stop()
+        for worker in (self._prepare_worker, self._workspace_worker):
             if worker and worker.isRunning():
                 worker.requestInterruption()
         return True

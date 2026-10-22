@@ -8,6 +8,8 @@ import stat
 import subprocess
 import sys
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +66,7 @@ class WorkspaceCreationResult:
     rolled_back_components: tuple[str, ...]
     pending_components: tuple[str, ...]
     error: str = ""
+    pushed_components: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -258,8 +261,36 @@ def build_workspace_creation_plan(
     name: str,
     description: str,
     selected_component_ids: list[str] | tuple[str, ...],
+    *,
+    progress: Callable[[int, int, str], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    timeout: float | None = None,
 ) -> WorkspaceCreationPlan:
     """先检查全部仓库，再返回不可变创建计划；不写文件。"""
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
+    def check_cancelled() -> None:
+        if cancelled and cancelled():
+            raise WorkspaceOperationError("预检已取消")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise WorkspaceOperationError("预检超时，请重试或检查项目目录是否可访问")
+
+    def run_git(source, args, limit=5):
+        check_cancelled()
+        remaining = max(0.001, deadline - time.monotonic()) if deadline is not None else limit
+        result = _run_git(source, args, min(limit, remaining))
+        check_cancelled()
+        return result
+
+    def git_value(source, args, label):
+        code, out, error = run_git(source, args)
+        if code != 0 or not out:
+            raise WorkspaceOperationError(error or out or f"无法读取 {label}")
+        return out.splitlines()[0].strip()
+
+    check_cancelled()
+    if progress:
+        progress(0, 1, "检查任务名称和目标目录")
     workspace_id = workspace_id_from_name(name)
     target_root = canonical_path(project.workspace_root / workspace_id)
     if not is_path_within(target_root, project.workspace_root, allow_equal=False):
@@ -274,6 +305,16 @@ def build_workspace_creation_plan(
     if unknown:
         raise WorkspaceOperationError("未知项目：" + ", ".join(sorted(unknown)))
 
+    total = len(selected_keys) * 8 + 1
+    step = 0
+
+    def report(component_id: str, message: str) -> None:
+        nonlocal step
+        check_cancelled()
+        step += 1
+        if progress:
+            progress(step, total, f"{component_id}：{message}")
+
     plan_components: list[WorkspacePlanComponent] = []
     seen_branches_by_remote: set[tuple[str, str]] = set()
     for component in project.components:
@@ -287,25 +328,31 @@ def build_workspace_creation_plan(
             continue
         if not source.is_dir():
             raise WorkspaceOperationError(f"项目目录不存在：{component.id}")
-        code, out, _err = _run_git(source, ["rev-parse", "--is-inside-work-tree"], 5)
+        report(component.id, "检查 Git 仓库")
+        code, out, _err = run_git(source, ["rev-parse", "--is-inside-work-tree"])
         if code != 0 or out != "true":
             raise WorkspaceOperationError(f"项目不是 Git 仓库：{component.id}")
-        base_branch = _git_value(source, ["branch", "--show-current"], "当前分支")
+        report(component.id, "读取当前分支")
+        base_branch = git_value(source, ["branch", "--show-current"], "当前分支")
         if not base_branch:
             raise WorkspaceOperationError(f"项目处于 detached HEAD：{component.id}")
-        base_commit = _git_value(source, ["rev-parse", "HEAD"], "基准提交")
+        report(component.id, "读取基准提交")
+        base_commit = git_value(source, ["rev-parse", "HEAD"], "基准提交")
         task_branch = f"feature/{workspace_id}-{component.id}"
-        code, _out, err = _run_git(source, ["check-ref-format", "--branch", task_branch], 5)
+        report(component.id, "检查任务分支名称")
+        code, _out, err = run_git(source, ["check-ref-format", "--branch", task_branch])
         if code != 0:
             raise WorkspaceOperationError(
                 f"任务分支名无效：{task_branch} ({err})"
             )
-        code, _out, _err = _run_git(
-            source, ["show-ref", "--verify", "--quiet", f"refs/heads/{task_branch}"], 5,
+        report(component.id, "检查本地重名分支")
+        code, _out, _err = run_git(
+            source, ["show-ref", "--verify", "--quiet", f"refs/heads/{task_branch}"],
         )
         if code == 0:
             raise WorkspaceOperationError(f"本地任务分支已存在：{task_branch}")
-        code, remote_refs, err = _run_git(
+        report(component.id, "检查远端分支缓存")
+        code, remote_refs, err = run_git(
             source, ["for-each-ref", "--format=%(refname)", "refs/remotes"], 10,
         )
         if code != 0:
@@ -316,12 +363,17 @@ def build_workspace_creation_plan(
             for ref in remote_refs.splitlines()
         ):
             raise WorkspaceOperationError(f"远端任务分支已存在：{task_branch}")
-        remote = _remote_identity(source)
+        report(component.id, "检查仓库来源")
+        remote_code, remote_value, _err = run_git(source, ["remote", "get-url", "origin"])
+        remote = remote_value if remote_code == 0 else ""
+        if not remote:
+            raise WorkspaceOperationError(f"{component.id} 未配置 origin，无法创建并备份任务分支")
         remote_key = (remote.casefold(), task_branch.casefold())
         if remote and remote_key in seen_branches_by_remote:
             raise WorkspaceOperationError(f"同一远端任务分支重复：{task_branch}")
         seen_branches_by_remote.add(remote_key)
-        code, worktrees, err = _run_git(source, ["worktree", "list", "--porcelain"], 10)
+        report(component.id, "检查已有工作区")
+        code, worktrees, err = run_git(source, ["worktree", "list", "--porcelain"], 10)
         if code != 0:
             raise WorkspaceOperationError(err or f"无法检查 Worktree：{component.id}")
         if f"branch refs/heads/{task_branch}" in worktrees:
@@ -344,6 +396,9 @@ def build_workspace_creation_plan(
         raise WorkspaceOperationError(
             "选中的项目不能创建 Worktree：" + ", ".join(sorted(missing))
         )
+    check_cancelled()
+    if progress:
+        progress(total, total, "预检完成")
     return WorkspaceCreationPlan(
         aggregate_project=project,
         workspace_id=workspace_id,
@@ -409,9 +464,11 @@ def _task_agents_text(plan: WorkspaceCreationPlan) -> str:
         f"- 当前任务根目录：`{plan.root_path}`\n\n"
         "## 项目来源与合并目标\n\n"
         f"{editable_table}\n\n"
-        "开发完成后，各项目代码分别合并回表中的最终合并目标；"
-        "仅允许用户通过 mini-ide 的“合并代码”明确触发快进合并，"
-        "禁止 AI 自行合并仓库或强删分支。\n\n"
+        "工作区创建成功时任务分支已推送到 origin，后续只在表中的任务分支开发。"
+        "是否直接开发或创建需求工作区由用户决定，不因任务复杂自动创建工作区。\n\n"
+        "开发完成后，获得用户授权再通过 mini-ide CLI 同步基准分支到任务分支，"
+        "解决冲突并重新验证；然后合并回表中的最终合并目标并推送，最后删除工作区。"
+        "基准分支可能是 develop，不要擅自替换成 main/master。\n\n"
         "## 修改边界\n\n"
         "只允许修改上表中的可修改 Worktree。以下目录禁止在本需求中修改：\n\n"
         + ("\n".join(forbidden) if forbidden else "- 无")
@@ -420,7 +477,9 @@ def _task_agents_text(plan: WorkspaceCreationPlan) -> str:
         f"- `{Path(project.root_path) / 'AGENTS.md'}`\n\n"
         "## mini-ide 约束\n\n"
         "- 服务启动、停止、健康检查、日志、诊断和编译必须走 mini-ide CLI 或 GUI。\n"
-        "- 工作区创建、Review 和删除必须走 mini-ide；不要手工移动或递归删除 Worktree。\n"
+        "- 工作区创建、Review、同步、合并和删除必须走 mini-ide CLI；不要手工移动或递归删除 Worktree。\n"
+        "- 同步并备份使用 --workspace-sync-push；合并交付使用 --workspace-merge。\n"
+        "- 删除前先 --close-workspace 退出目标工作区，再 --workspace-delete；不要停止其他环境的服务。\n"
         "- codex 和 cc 的工作目录必须保持为当前任务根目录。\n"
         "\n"
         "## 标准开发流程：mine-dev-flow\n\n"
@@ -503,7 +562,10 @@ def _unexpected_worktree_status(
     return "\n".join(unexpected)
 
 
-def create_development_workspace(plan: WorkspaceCreationPlan) -> WorkspaceCreationResult:
+def create_development_workspace(
+    plan: WorkspaceCreationPlan,
+    *, progress: Callable[[int, int, str], None] | None = None,
+) -> WorkspaceCreationResult:
     operation_key = normalized_path_key(plan.root_path)
     with _OPERATION_LOCK:
         if operation_key in _ACTIVE_OPERATIONS:
@@ -512,13 +574,28 @@ def create_development_workspace(plan: WorkspaceCreationPlan) -> WorkspaceCreati
             )
         _ACTIVE_OPERATIONS.add(operation_key)
     created: list[WorkspacePlanComponent] = []
+    pushed: list[str] = []
+    workspace = None
     copied_files: dict[str, list[Path]] = {}
     rolled_back: list[str] = []
+    worktree_items = [item for item in plan.components if item.mode == "worktree"]
+    total = len(worktree_items) * 2 + 1
     try:
+        # Live remote checks belong to execution, never the GUI's read-only preflight.
+        for item in worktree_items:
+            if progress:
+                progress(0, total, f"{item.id}：检查远程任务分支")
+            code, out, err = _run_git(item.source_path,
+                ["ls-remote", "--heads", "origin", f"refs/heads/{item.task_branch}"], 60)
+            if code != 0:
+                raise WorkspaceOperationError(err or f"无法检查 {item.id} 的远程任务分支")
+            if out:
+                raise WorkspaceOperationError(f"远程任务分支已存在：{item.task_branch}")
         root = Path(plan.root_path)
         root.mkdir(parents=True, exist_ok=False)
-        worktree_items = [item for item in plan.components if item.mode == "worktree"]
-        for item in worktree_items:
+        for index, item in enumerate(worktree_items):
+            if progress:
+                progress(index, total, f"正在创建 {item.id} 的独立开发目录")
             code, out, err = _run_git(
                 item.source_path,
                 ["worktree", "add", "-b", item.task_branch, item.target_path, item.base_commit],
@@ -528,8 +605,12 @@ def create_development_workspace(plan: WorkspaceCreationPlan) -> WorkspaceCreati
                 raise WorkspaceOperationError(err or out or f"创建 {item.id} 失败")
             created.append(item)
             if item.workspace_copy_files:
+                if progress:
+                    progress(index, total, f"{item.id}：复制本地配置文件")
                 copied_files[item.id] = _copy_workspace_files(item)
 
+        if progress:
+            progress(len(worktree_items), total, "正在写入工作区信息")
         workspace_components = [
             WorkspaceComponent(
                 id=item.id,
@@ -557,10 +638,31 @@ def create_development_workspace(plan: WorkspaceCreationPlan) -> WorkspaceCreati
         _write_text_atomic(root / "AGENTS.md", _task_agents_text(plan))
         _write_text_atomic(root / "context.md", _context_text(plan))
         save_development_workspace(workspace, aggregate_project=plan.aggregate_project)
+        for index, item in enumerate(worktree_items):
+            if progress:
+                progress(len(worktree_items) + index + 1, total, f"{item.id}：推送任务分支到 origin")
+            # An empty expected ref permits creation only, never overwriting a concurrent branch.
+            code, out, err = _run_git(item.target_path,
+                ["push", "--set-upstream", f"--force-with-lease=refs/heads/{item.task_branch}:",
+                 "origin", f"{item.task_branch}:refs/heads/{item.task_branch}"], 300)
+            if code != 0:
+                raise WorkspaceOperationError(f"{item.id} 任务分支推送未确认成功：{err or out}")
+            pushed.append(item.id)
+        if progress:
+            progress(total, total, "工作区和远程任务分支创建完成")
         return WorkspaceCreationResult(
-            True, workspace, tuple(item.id for item in created), (), (), "",
+            True, workspace, tuple(item.id for item in created), (), (), "", tuple(pushed),
         )
     except Exception as exc:
+        if workspace is not None and (Path(plan.root_path) / "workspace.json").is_file():
+            return WorkspaceCreationResult(
+                False, workspace, tuple(item.id for item in created), (),
+                tuple(item.id for item in worktree_items if item.id not in pushed),
+                f"{exc}。本地工作区已保留；请核对远端后继续推送，不要重复创建或删除远程分支。",
+                tuple(pushed),
+            )
+        if progress:
+            progress(len(created), total, "创建失败，正在回滚本次已创建的目录")
         for item in reversed(created):
             for copied in reversed(copied_files.get(item.id, [])):
                 try:

@@ -136,7 +136,7 @@ def _attach_console():
         pass
 
 
-SERVER_NAME = "mini-ide-single-instance"
+from src.core.cli_contract import SERVER_NAME
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -157,336 +157,38 @@ def _decode_response(response_buf: bytes):
 
 
 def _parse_args(argv: list[str]) -> dict | None:
-    """解析 CLI 参数为 JSON 命令 dict。返回 None 表示参数错误。"""
-    args = argv[1:]  # 跳过程序名
-    if not args:
+    from src.core.cli_contract import ArgumentError, parse_command
+    try:
+        return parse_command(argv[1:])
+    except ArgumentError:
         return None
-
-    cmd_name = args[0].lstrip("-")  # --list-projects → list-projects
-    cmd_map = {
-        "version": "version",
-        "status": "status",
-        "list-projects": "list-projects",
-        "list-modules": "list-modules",
-        "list-runtimes": "list-runtimes",
-        "open": "open",
-        "resolve-target": "resolve-target",
-        "close": "close",
-        "list-workspaces": "list-workspaces",
-        "open-workspace": "open-workspace",
-        "close-workspace": "close-workspace",
-        "list-aggregates": "list-aggregates",
-        "open-aggregate": "open-aggregate",
-        "create-development-workspace": "create-development-workspace",
-        "workspace-review": "workspace-review",
-        "workspace-commit-push": "workspace-commit-push",
-        "workspace-sync": "workspace-sync",
-        "workspace-delete-check": "workspace-delete-check",
-        "start": "start",
-        "stop": "stop",
-        "restart": "restart",
-        "ensure-running": "ensure-running",
-        "health": "health",
-        "compile": "compile",
-        "log": "log",
-        "diagnose": "diagnose",
-        "git-status": "git-status",
-        "git-diff": "git-diff",
-        "git-ai-context": "git-ai-context",
-        "preflight-build": "preflight-build",
-        "can-quit": "preflight-build",
-        "quit": "quit",
-    }
-    if cmd_name not in cmd_map:
-        return None
-
-    result: dict = {"cmd": cmd_map[cmd_name]}
-    rest = args[1:]
-
-    if cmd_name == "version":
-        return result if not rest else None
-
-    if cmd_name in ("status", "list-projects", "list-workspaces", "close-workspace",
-                    "list-aggregates", "can-quit"):
-        return result
-
-    if cmd_name == "preflight-build":
-        if len(rest) > 1:
-            return None
-        if rest:
-            result["project"] = rest[0]
-        return result
-
-    if cmd_name == "quit":
-        return result
-
-    if cmd_name == "open":
-        if not rest:
-            return None
-        result["path"] = rest[0]
-        return result
-
-    if cmd_name == "close":
-        if not rest:
-            return None
-        result["project"] = rest[0]
-        return result
-
-    if cmd_name == "open-workspace":
-        if not rest:
-            return None
-        result["target"] = " ".join(rest).strip()
-        return result
-
-    if cmd_name in (
-        "open-aggregate",
-        "workspace-review", "workspace-delete-check",
-    ):
-        if not rest:
-            return None
-        result["target"] = rest[0]
-        return result if len(rest) == 1 else None
-
-    if cmd_name == "workspace-commit-push":
-        if not rest:
-            return None
-        result["target"] = rest[0]
-        index = 1
-        while index < len(rest):
-            if rest[index] == "--message" and index + 1 < len(rest):
-                message = rest[index + 1].strip()
-                if not message:
-                    return None
-                result["message"] = message
-                index += 2
-            else:
-                return None
-        return result
-
-    if cmd_name == "resolve-target":
-        if len(rest) != 1:
-            return None
-        result["path"] = rest[0]
-        return result
-
-    if cmd_name == "workspace-sync":
-        if not rest:
-            return None
-        result["target"] = rest[0]
-        index = 1
-        while index < len(rest):
-            if rest[index] == "--fetch":
-                result["fetch_remote"] = True
-                index += 1
-            elif rest[index] == "--keep-conflicts":
-                result["keep_conflicts"] = True
-                index += 1
-            else:
-                return None
-        return result
-
-    if cmd_name == "create-development-workspace":
-        if len(rest) < 2:
-            return None
-        result["aggregate"] = rest[0]
-        result["name"] = rest[1]
-        index = 2
-        while index < len(rest):
-            if rest[index] == "--projects" and index + 1 < len(rest):
-                result["projects"] = [
-                    item.strip() for item in rest[index + 1].split(",") if item.strip()
-                ]
-                index += 2
-            elif rest[index] == "--description" and index + 1 < len(rest):
-                result["description"] = rest[index + 1]
-                index += 2
-            else:
-                return None
-        if not result.get("projects"):
-            return None
-        return result
-
-    if cmd_name in ("list-modules", "list-runtimes"):
-        if not rest:
-            return None
-        result["project"] = rest[0]
-        return result
-
-    if cmd_name in ("start", "stop", "restart"):
-        if not rest:
-            return None
-        result["project"] = rest[0]
-        i = 1
-        if i < len(rest) and not rest[i].startswith("--"):
-            result["module"] = rest[i]
-            i += 1
-        while i < len(rest):
-            if rest[i] == "--wait":
-                result["wait"] = True
-                i += 1
-            elif rest[i] == "--timeout" and i + 1 < len(rest):
-                try:
-                    result["timeout"] = int(rest[i + 1])
-                except ValueError:
-                    return None
-                i += 2
-            else:
-                return None
-        if result.get("wait") and "timeout" not in result:
-            result["timeout"] = 60
-        return result
-
-    if cmd_name == "ensure-running":
-        if not rest:
-            return None
-        result["project"] = rest[0]
-        i = 1
-        if i < len(rest) and not rest[i].startswith("--"):
-            result["module"] = rest[i]
-            i += 1
-        while i < len(rest):
-            if rest[i] == "--timeout" and i + 1 < len(rest):
-                try:
-                    result["timeout"] = int(rest[i + 1])
-                except ValueError:
-                    return None
-                i += 2
-            else:
-                return None
-        if "timeout" not in result:
-            result["timeout"] = 60
-        return result
-
-    if cmd_name == "health":
-        if not rest:
-            return None
-        result["project"] = rest[0]
-        i = 1
-        if i < len(rest) and not rest[i].startswith("--"):
-            result["module"] = rest[i]
-            i += 1
-        while i < len(rest):
-            if rest[i] == "--timeout" and i + 1 < len(rest):
-                try:
-                    result["timeout"] = int(rest[i + 1])
-                except ValueError:
-                    return None
-                i += 2
-            else:
-                return None
-        if "timeout" not in result:
-            result["timeout"] = 60
-        return result
-
-    if cmd_name == "compile":
-        if not rest:
-            return None
-        result["project"] = rest[0]
-        i = 1
-        while i < len(rest):
-            if rest[i] == "--timeout" and i + 1 < len(rest):
-                try:
-                    result["timeout"] = int(rest[i + 1])
-                except ValueError:
-                    return None
-                i += 2
-            else:
-                return None
-        if "timeout" not in result:
-            # 冷编译 Gradle/Maven 动辄数十秒到几分钟，给宽松默认值
-            result["timeout"] = 300
-        return result
-
-    if cmd_name == "log":
-        if not rest:
-            return None
-        result["project"] = rest[0]
-        i = 1
-        if i < len(rest) and not rest[i].startswith("--"):
-            result["module"] = rest[i]
-            i += 1
-        while i < len(rest):
-            if rest[i] == "--tail" and i + 1 < len(rest):
-                try:
-                    result["tail"] = int(rest[i + 1])
-                except ValueError:
-                    return None
-                i += 2
-            elif rest[i] == "--errors":
-                result["errors"] = True
-                i += 1
-            elif rest[i] == "--all-modules":
-                result["all_modules"] = True
-                i += 1
-            else:
-                return None
-        if "tail" not in result:
-            result["tail"] = 50
-        return result
-
-    if cmd_name == "diagnose":
-        if not rest:
-            return None
-        result["project"] = rest[0]
-        i = 1
-        if i < len(rest) and not rest[i].startswith("--"):
-            result["module"] = rest[i]
-            i += 1
-        while i < len(rest):
-            if rest[i] == "--tail" and i + 1 < len(rest):
-                try:
-                    result["tail"] = int(rest[i + 1])
-                except ValueError:
-                    return None
-                i += 2
-            else:
-                return None
-        if "tail" not in result:
-            result["tail"] = 120
-        return result
-
-    if cmd_name in ("git-status", "git-diff", "git-ai-context"):
-        if not rest:
-            return None
-        result["project"] = rest[0]
-        i = 1
-        while i < len(rest):
-            if rest[i] == "--full":
-                result["mode"] = "full"
-                i += 1
-            elif rest[i] == "--summary":
-                result["mode"] = "summary"
-                i += 1
-            elif rest[i] == "--max-chars" and i + 1 < len(rest):
-                try:
-                    result["max_chars"] = int(rest[i + 1])
-                except ValueError:
-                    return None
-                i += 2
-            else:
-                return None
-        if "mode" not in result:
-            result["mode"] = "summary"
-        return result
-
-    return None
 
 
 def _response_timeout_ms(cmd: dict) -> int:
     """按命令生命周期设置 IPC 等待时间。"""
     action = cmd["cmd"]
+    if cmd.get("async"):
+        return 30000
+    if action == "operation":
+        return (int(cmd.get("wait_seconds", 0)) + 5) * 1000
     if action == "quit":
         return 120000
     if action in (
-        "health", "compile", "ensure-running",
+        "health", "compile", "run-action", "ensure-running",
+        "open-workspace",
         "create-development-workspace", "workspace-review", "workspace-delete-check",
-        "workspace-commit-push", "workspace-sync",
+        "workspace-commit-push", "workspace-sync", "workspace-sync-push",
+        "workspace-merge", "workspace-delete",
     ) or action in ("start", "stop", "restart"):
         defaults = {
             "start": 60, "stop": 60, "restart": 60,
             "create-development-workspace": 600,
+            "open-workspace": 600,
             "workspace-commit-push": 600,
             "workspace-sync": 600,
+            "workspace-sync-push": 600,
+            "workspace-merge": 600,
+            "workspace-delete": 600,
         }
         timeout = int(cmd.get("timeout", defaults.get(action, 120)))
         return (timeout + 5) * 1000
@@ -532,15 +234,44 @@ def run_cli(argv: list[str]) -> int:
     auto_start = "--auto-start" in argv
     filtered_argv = [a for a in argv if a != "--auto-start"]
 
-    cmd = _parse_args(filtered_argv)
-    if cmd is None:
-        _safe_write(sys.stderr, json.dumps({"ok": False, "error": "invalid arguments"}) + "\n")
-        _print_usage()
+    from src.core.cli_contract import (
+        ArgumentError, capabilities, help_text, machine_result, normalize_targets,
+        parse_command, result_code,
+    )
+    machine = "--machine" in filtered_argv
+    filtered_argv = [arg for arg in filtered_argv if arg != "--machine"]
+
+    def emit(result, *, failure=False, command=""):
+        payload = machine_result(command or cmd.get("cmd", ""), result) if machine else result
+        _safe_write(sys.stdout if machine or not failure else sys.stderr,
+                    json.dumps(payload, ensure_ascii=False) + "\n")
+
+    cmd = {}
+    try:
+        cmd = normalize_targets(parse_command(filtered_argv[1:]))
+    except ArgumentError as exc:
+        emit({"ok": False, "code": "invalid_arguments", "error": str(exc)}, failure=True)
+        if not machine:
+            _safe_write(sys.stderr, help_text())
         return EXIT_BAD_ARGS
 
+    if cmd["cmd"] == "help":
+        try:
+            content = help_text(cmd.get("command"))
+        except ArgumentError as exc:
+            emit({"ok": False, "code": "invalid_arguments", "error": str(exc)}, failure=True)
+            return EXIT_BAD_ARGS
+        if machine:
+            emit({"ok": True, "help": content})
+        else:
+            _safe_write(sys.stdout, content)
+        return EXIT_OK
+    if cmd["cmd"] == "capabilities":
+        emit(capabilities())
+        return EXIT_OK
     if cmd["cmd"] == "version":
         from src.core.app_version import build_info
-        _safe_write(sys.stdout, json.dumps({"ok": True, **build_info()}, ensure_ascii=False) + "\n")
+        emit({"ok": True, **build_info()})
         return EXIT_OK
 
     # quit / preflight-build / status 不触发自动启动
@@ -555,10 +286,10 @@ def run_cli(argv: list[str]) -> int:
             sock = QLocalSocket()
             sock.connectToServer(SERVER_NAME)
             if not sock.waitForConnected(5000):
-                _safe_write(sys.stderr, json.dumps({"ok": False, "error": "mini-ide started but IPC not ready"}) + "\n")
+                emit({"ok": False, "code": "ide_not_running", "error": "mini-ide started but IPC not ready"}, failure=True)
                 return EXIT_NOT_RUNNING
         else:
-            _safe_write(sys.stderr, json.dumps({"ok": False, "error": "mini-ide is not running"}) + "\n")
+            emit({"ok": False, "code": "ide_not_running", "error": "mini-ide is not running"}, failure=True)
             return EXIT_NOT_RUNNING
 
     payload = json.dumps(cmd, ensure_ascii=False) + "\n"
@@ -572,7 +303,7 @@ def run_cli(argv: list[str]) -> int:
     while True:
         remaining = int((deadline - time.time()) * 1000)
         if remaining <= 0:
-            _safe_write(sys.stderr, json.dumps({"ok": False, "error": "timeout waiting for response"}) + "\n")
+            emit({"ok": False, "code": "transport_timeout", "error": "timeout waiting for response; query the operation or retry with the same request-id"}, failure=True)
             sock.disconnectFromServer()
             return EXIT_TIMEOUT
         if sock.waitForReadyRead(min(remaining, 500)):
@@ -586,64 +317,24 @@ def run_cli(argv: list[str]) -> int:
 
     result, response_error = _decode_response(response_buf)
     if response_error:
-        _safe_write(
-            sys.stderr,
-            json.dumps({"ok": False, "error": response_error}) + "\n",
-        )
+        emit({"ok": False, "code": "invalid_response", "error": response_error}, failure=True)
         return EXIT_FAIL
-
-    _safe_write(sys.stdout, json.dumps(result, ensure_ascii=False) + "\n")
 
     if isinstance(result, dict) and result.get("ok") is False:
-        error = result.get("error", "")
-        if "timeout" in error:
-            return EXIT_TIMEOUT
-        if "not found" in error:
-            return EXIT_BAD_ARGS
-        return EXIT_FAIL
-    return EXIT_OK
+        result.setdefault("code", result_code(result))
+    emit(result)
+    code = result_code(result)
+    if code == "ok":
+        return EXIT_OK
+    if "timeout" in code:
+        return EXIT_TIMEOUT
+    if code == "ide_not_running":
+        return EXIT_NOT_RUNNING
+    if code in ("invalid_arguments", "target_not_found", "project_not_found", "action_not_found", "operation_not_found"):
+        return EXIT_BAD_ARGS
+    return EXIT_FAIL
 
 
 def _print_usage():
-    _safe_write(
-        sys.stderr,
-        "Usage: mini-ide <command> [args...]\n"
-        "Commands:\n"
-        "  --status                     Snapshot IDE/projects/services/workspaces\n"
-        "  --version                    Show this CLI package version without connecting to GUI\n"
-        "  --list-projects              List all open projects\n"
-        "  --list-modules <project>     List modules of a project\n"
-        "  --list-runtimes <project>    List runtime units of a project\n"
-        "  --open <path>                Open a project path in the running IDE\n"
-        "  --resolve-target <path>      Resolve a path to its owning environment/component\n"
-        "  --close <project>            Stop services and close a project tab\n"
-        "  --list-workspaces            List aggregate development workspaces\n"
-        "  --open-workspace <target>    Open one workspace inside its aggregate tab\n"
-        "  --close-workspace            Return the current aggregate tab to source projects\n"
-        "  --list-aggregates            List aggregate project definitions\n"
-        "  --open-aggregate <target>    Open one aggregate project tab\n"
-        "  --create-development-workspace <aggregate> <name> --projects a,b [--description text]\n"
-        "  --workspace-review <target>\n"
-        "  --workspace-commit-push <target> [--message text]\n"
-        "                               Commit changes and push task branches to origin\n"
-        "  --workspace-sync <target> [--fetch] [--keep-conflicts]\n"
-        "                               Merge the source base branch into task branches\n"
-        "  --workspace-delete-check <target>\n"
-        "  --start <project> [module]   Start a module\n"
-        "  --stop <project> [module]    Stop a module\n"
-        "  --restart <project> [module] Restart a module\n"
-        "  --ensure-running <project> [module] [--timeout N]  Start if needed and wait\n"
-        "  --health <project> [module] [--timeout N]  Wait for startup\n"
-        "  --compile <project>          Trigger compilation\n"
-        "  --log <project> [module] [--tail N] [--errors] [--all-modules]\n"
-        "  --diagnose <project> [module] [--tail N]  Get service/log diagnosis\n"
-        "  --git-status <project>       Get git branch and changed files\n"
-        "  --git-diff <project> [--summary|--full] [--max-chars N]\n"
-        "  --git-ai-context <project> [--summary|--full] [--max-chars N]\n"
-        "  --preflight-build [project]  Check target project, or all projects if omitted\n"
-        "  --can-quit                   Check all running services before quitting\n"
-        "  --quit                       Stop all running services and exit mini-ide\n"
-        "\nOptions:\n"
-        "  --auto-start                 If mini-ide is not running, launch it automatically\n"
-        "                               (ignored for --status / --preflight-build / --quit)\n"
-    )
+    from src.core.cli_contract import help_text
+    _safe_write(sys.stderr, help_text())

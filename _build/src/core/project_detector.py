@@ -749,11 +749,12 @@ def _detect_node(root: Path) -> ProjectMeta | None:
     # 任何未识别的 script 也给个"更多命令"入口
     extras = [s for s in scripts if s not in {"dev", "serve", "start", "build", "preview", "test", "start:preview"}]
     for s in extras[:10]:
+        action_kind = "test" if s.split(":")[0] in {"test", "unit", "e2e", "lint", "check", "typecheck"} else "run"
         profiles.append(RunProfile(
             name=f"script:{s}",
             label=f"▸ {s}",
             command=[pm, "run", s] if pm == "npm" else [pm, run_word, s],
-            kind="run", icon="",
+            kind=action_kind, icon="",
             description=scripts.get(s, ""),
         ))
 

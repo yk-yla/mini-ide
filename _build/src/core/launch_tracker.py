@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from src.core.run_logs import RunLog
 
 
 def health_markers(project_type: str) -> tuple[str, ...]:
@@ -45,6 +46,7 @@ class LaunchState:
     ready_line: str = ""
     finished: bool = False
     exit_code: int | None = None
+    output: RunLog = field(default_factory=RunLog)
 
 
 class LaunchTracker:
@@ -81,7 +83,10 @@ class LaunchTracker:
 
     def record_output(self, target: str, line: str) -> None:
         state = self._states.get(target)
-        if state is None or state.finished or state.ready:
+        if state is None or state.finished:
+            return
+        state.output.append(line)
+        if state.ready:
             return
         if any(marker in line for marker in self._markers):
             state.ready = True

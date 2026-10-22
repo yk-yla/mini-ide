@@ -21,6 +21,17 @@ SOURCE_MANAGED_RUNNER = "managed_runner"
 SOURCE_EXTERNAL_DETECTOR = "external_detector"
 SOURCE_SCRIPT_RUNNER = "script_runner"
 
+class EnvironmentSwitchBlocked(RuntimeError):
+    """无人值守切换环境时，保留服务现场并向调用端报告阻塞。"""
+
+    def __init__(self, running: list[dict], source_path: str, target_path: str):
+        super().__init__("environment has running services; stop the listed services before switching")
+        self.result = {
+            "ok": False, "code": "services_running", "error": str(self),
+            "running": running, "source_path": source_path, "target_path": target_path,
+        }
+
+
 KIND_PROJECT = "project"
 KIND_MODULE = "module"
 KIND_SCRIPT = "script"

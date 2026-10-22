@@ -16,6 +16,26 @@ from src.util.git_executable import resolve_git_executable
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
 _POPEN_KW = {"creationflags": _NO_WINDOW} if _NO_WINDOW else {}
 
+# 被忽略文件集合的缓存。`git ls-files --ignored` 要遍历整个仓库，是这批调用里最贵
+# 的一条，而结果极少变化。按 cwd 缓存，TTL 与状态栏轮询间隔（3s）同量级但不小于它。
+_IGNORED_CACHE: dict[str, tuple[float, set[str]]] = {}
+_IGNORED_TTL = 10.0
+
+# 当前分支名的短缓存。状态栏每 3s 一轮都会问 current_branch，但分支只在切分支时变。
+_BRANCH_CACHE: dict[str, tuple[float, str]] = {}
+_BRANCH_TTL = 10.0
+
+
+def invalidate_ignored_cache(cwd: str | None = None) -> None:
+    """清掉被忽略文件缓存。传 None 清全部。
+
+    .gitignore 变化、切换分支、拉取代码后应调用，避免用到过期的忽略集合。
+    """
+    if cwd is None:
+        _IGNORED_CACHE.clear()
+    else:
+        _IGNORED_CACHE.pop(cwd, None)
+
 
 @dataclass
 class ChangedFile:
@@ -148,12 +168,20 @@ def list_ignored_files(cwd: str) -> set[str]:
 
     用 git ls-files --others --ignored --exclude-standard --directory：
     --directory 让被整体忽略的目录折成单条（如 node_modules/），不展开里面 N 万个文件。
+    结果按 cwd 缓存 _IGNORED_TTL 秒：这条要遍历整个仓库，是刷新链路里最贵的调用，
+    而忽略列表极少变化。.gitignore 变更/切分支后由调用方 invalidate_ignored_cache()。
     """
+    now = time.time()
+    cached = _IGNORED_CACHE.get(cwd)
+    if cached is not None and now - cached[0] < _IGNORED_TTL:
+        return cached[1]
+
     rc, out, _ = _run(
         ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
         cwd, timeout=15,
     )
     if rc != 0:
+        # 失败不写缓存，下一轮重试
         return set()
     result: set[str] = set()
     for ln in out.splitlines():
@@ -165,6 +193,7 @@ def list_ignored_files(cwd: str) -> set[str]:
         # 目录条目末尾带 /，去掉好与 file_tree 的 rel 字符串一致
         path = path.rstrip("/")
         result.add(path.replace("\\", "/"))
+    _IGNORED_CACHE[cwd] = (now, result)
     return result
 
 
@@ -259,8 +288,20 @@ def get_untracked_preview(cwd: str, path: str, max_lines: int = 200) -> str:
 
 
 def current_branch(cwd: str) -> str:
+    """当前分支名。带短缓存：状态栏每 3s 一轮都会问，但分支只在切分支时变。
+
+    不加缓存时每轮都会起一个 git 子进程，是刷新链路里仅次于 status 的开销来源。
+    切分支/fetch/merge 后由 _after_worktree_change() 主动失效。
+    """
+    now = time.time()
+    cached = _BRANCH_CACHE.get(cwd)
+    if cached is not None and now - cached[0] < _BRANCH_TTL:
+        return cached[1]
     rc, out, _ = _run(["rev-parse", "--abbrev-ref", "HEAD"], cwd, timeout=3)
-    return out.strip() if rc == 0 else ""
+    branch = out.strip() if rc == 0 else ""
+    if rc == 0:
+        _BRANCH_CACHE[cwd] = (now, branch)
+    return branch
 
 
 def list_branches(cwd: str, include_remote: bool = True) -> dict:
@@ -288,6 +329,10 @@ def git_fetch(cwd: str) -> bool:
     注意：此函数同步执行网络操作，调用方必须放后台线程，否则冻结 UI。
     """
     rc, _, _ = _run(["fetch", "--quiet", "--all"], cwd, timeout=60)
+    if rc == 0:
+        # fetch 后 ahead/behind 会变，让 git_info 缓存失效，下一轮重新统计
+        from src.util import git_info
+        git_info.invalidate(cwd)
     return rc == 0
 
 
@@ -306,8 +351,21 @@ def git_checkout(cwd: str, branch: str) -> tuple[bool, str]:
     """切换分支。返回 (成功, 错误信息)。"""
     rc, out, err = _run(["checkout", branch], cwd, timeout=30)
     if rc == 0:
+        _after_worktree_change(cwd)
         return True, ""
     return False, (err or out).strip()
+
+
+def _after_worktree_change(cwd: str) -> None:
+    """工作区/分支变化后清掉相关缓存，避免下一轮刷新读到过期结果。
+
+    切分支会同时改变：当前分支名、改动文件列表、被忽略文件集合、ahead/behind。
+    TTL 只在"没事件"时兜底；有明确事件时立即失效，保证状态栏及时。
+    """
+    from src.util import git_info
+    git_info.invalidate(cwd)
+    invalidate_ignored_cache(cwd)
+    _BRANCH_CACHE.pop(cwd, None)
 
 
 def _local_name_from_remote(remote_branch: str) -> str:
@@ -332,6 +390,7 @@ def git_checkout_remote_branch(cwd: str, remote_branch: str) -> tuple[bool, str]
 
     rc, out, err = _run(["checkout", "--track", "-b", local_branch, remote_branch], cwd, timeout=30)
     if rc == 0:
+        _after_worktree_change(cwd)
         return True, ""
     return False, (err or out).strip()
 
@@ -392,6 +451,7 @@ def git_merge_remote_branch(cwd: str, remote_branch: str) -> tuple[bool, str]:
     if rc != 0:
         return False, f"合并成功但 push 失败：{(err or out).strip()}\n\n{summary}"
 
+    _after_worktree_change(cwd)
     return True, summary
 
 

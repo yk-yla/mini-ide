@@ -15,6 +15,10 @@ sys.path.insert(0, str(ROOT))
 
 modules = [
     "src.core.app_version",
+    "src.core.cli_contract",
+    "src.core.cli_operations",
+    "src.core.project_inspection",
+    "src.core.run_logs",
     "src.core.config",
     "src.core.project_detector",
     "src.core.runtime_units",
@@ -160,7 +164,7 @@ def cli_parse_check() -> list[str]:
         (["mini-ide.exe", "--list-runtimes", "webapp-lerna"],
          {"cmd": "list-runtimes", "project": "webapp-lerna"}),
         (["mini-ide.exe", "--open-workspace", "race", "dev"], {"cmd": "open-workspace", "target": "race dev"}),
-        (["mini-ide.exe", "--close-workspace"], {"cmd": "close-workspace"}),
+        (["mini-ide.exe", "--close-workspace", "race dev"], {"cmd": "close-workspace", "target": "race dev"}),
         (["mini-ide.exe", "--list-aggregates"], {"cmd": "list-aggregates"}),
         (["mini-ide.exe", "--open-aggregate", "race"],
          {"cmd": "open-aggregate", "target": "race"}),
@@ -672,6 +676,10 @@ def development_workspace_lifecycle_check() -> list[str]:
         git("init", "--bare", str(bare_remote))
         git("-C", str(repo_one), "remote", "add", "origin", str(bare_remote))
         git("-C", str(repo_one), "push", "--set-upstream", "origin", "main")
+        webapp_remote = Path(tmp) / "webapp-origin.git"
+        git("init", "--bare", str(webapp_remote))
+        git("-C", str(repo_two), "remote", "add", "origin", str(webapp_remote))
+        git("-C", str(repo_two), "push", "--set-upstream", "origin", "main")
         shared.mkdir(parents=True)
         project = AggregateProject.from_dict(root, {
             "schemaVersion": 1,
@@ -1324,10 +1332,8 @@ def aggregate_runtime_ui_check() -> list[str]:
         )
         card = _WorkspaceCard(card_summary, False)
         card_buttons = [button.text() for button in card.findChildren(QPushButton)]
-        if "同步并推送" not in card_buttons:
-            failed.append("workspace card must expose the combined sync and push action")
-        if "提交并推送" in card_buttons or "同步源分支" in card_buttons:
-            failed.append("workspace card must remove the two separate legacy actions")
+        if card_buttons != ["进入工作区"]:
+            failed.append("workspace cards must expose only entry; lifecycle actions belong to CLI")
         card.deleteLater()
         double_clicks: list[bool] = []
         tab._activate_selected_workspace = lambda: double_clicks.append(True)
@@ -2378,7 +2384,7 @@ def target_resolution_check() -> list[str]:
 
     failed: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp) / "paike"
+        root = Path(tmp).resolve() / "paike"
         server = root / "server"
         webapp = root / "webapp"
         workspace_root = root / "workspace" / "task"
@@ -2432,6 +2438,41 @@ def target_resolution_check() -> list[str]:
         result = resolve_target_path(webapp, [str(root)])
         if result.open_command != "open-aggregate" or result.component_id != "webapp":
             failed.append("aggregate component should route to aggregate and component")
+
+        ordinary = Path(tmp).resolve() / "ordinary"
+        (ordinary / "src" / "views").mkdir(parents=True)
+        (ordinary / "package.json").write_text('{"scripts":{"build":"echo build"}}')
+        nested = ordinary / "packages" / "nested"
+        (nested / "src").mkdir(parents=True)
+        (nested / "pyproject.toml").write_text('[project]\nname="nested"\n')
+        repository = ordinary / "vendor" / "repository"
+        (repository / "src").mkdir(parents=True)
+        (repository / ".git").write_text("gitdir: linked-worktree\n")
+        unlisted = root / "unrelated"
+        (unlisted / "src").mkdir()
+        (unlisted / "go.mod").write_text("module example.invalid/check\n")
+        # 聚合组件中的嵌套 manifest 不能改变显式组件归属。
+        (server / "src" / "package.json").write_text("{}")
+        for path, project_root in (
+            (ordinary / "src" / "views", ordinary), (nested / "src", nested),
+            (repository / "src", repository), (unlisted / "src", unlisted),
+        ):
+            result = resolve_target_path(path)
+            if result.project_target != str(project_root) or result.open_target != str(project_root):
+                failed.append(f"ordinary subdirectory must resolve to nearest project: {path}")
+            if result.path != str(path):
+                failed.append("resolved path must preserve the requested directory")
+        if resolve_target_path(server / "src").project_target != str(server):
+            failed.append("explicit aggregate component boundary must take precedence")
+        from src.core.project_inspection import inspect_directory
+        context = inspect_directory(str(ordinary / "src"))
+        if context["projects"][0]["type"] != "node" or not context["projects"][0]["actions"]:
+            failed.append("context from an ordinary child must discover its root actions")
+        empty = root / "empty" / "child"
+        empty.mkdir(parents=True)
+        (root / ".git").mkdir()
+        if resolve_target_path(empty).project_target != str(empty):
+            failed.append("unlisted directories must not escape their aggregate boundary")
 
     if failed:
         for msg in failed:

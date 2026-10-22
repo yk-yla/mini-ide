@@ -611,7 +611,7 @@ class MainWindow(QMainWindow):
                 tab.select_component(resolved.component_id)
             return tab
 
-        p = Path(resolved.path)
+        p = Path(resolved.open_target)
 
         existing = self.find_tab_by_path(str(p))
         if existing:
