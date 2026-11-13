@@ -1,19 +1,35 @@
-"""打包时准备下一版本，全部产物生成成功后才更新源码版本。"""
+"""打包版本以 git tag 为准：先取远程最新 vX.Y.Z tag 递增，产物齐全才打 tag 并推送。"""
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-import tempfile
-import tomllib
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+GIT_TIMEOUT = 120
+PUSH_ATTEMPTS = 3
 
-def read_version(root: Path) -> str:
-    data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    return str(data["tool"]["poetry"]["version"])
+
+def _run_git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT,
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+        raise ValueError(f"git {' '.join(args)} 失败: {detail}")
+    return result
+
+
+def latest_version_tag(repo: Path) -> str | None:
+    lines = _run_git(repo, "tag", "--list", "v*", "--sort=-v:refname").stdout.splitlines()
+    for line in lines:
+        if TAG_RE.fullmatch(line.strip()):
+            return line.strip()
+    return None
 
 
 def next_version(version: str) -> str:
@@ -47,9 +63,22 @@ def version_resource(version: str, filename: str) -> str:
 
 
 def prepare(root: Path, output: Path) -> dict:
-    previous = read_version(root)
-    version = next_version(previous)
-    data = {"previous_version": previous, "version": version,
+    repo = root.parent
+    fetch = _run_git(repo, "fetch", "origin", "--tags", "--force", check=False)
+    if fetch.returncode != 0:
+        detail = (fetch.stderr or fetch.stdout).strip()
+        raise ValueError(
+            "无法获取远程 tag，为避免多台机器版本号分叉已中止打包，请检查网络后重试。"
+            f"git fetch 输出: {detail}"
+        )
+    latest = latest_version_tag(repo)
+    if latest is None:
+        raise ValueError("仓库还没有 vX.Y.Z 格式的 tag，请先打一个基线 tag 再打包")
+    status = _run_git(repo, "status", "--porcelain", check=False).stdout
+    if status.strip():
+        print("[build] WARNING: 工作区有未提交改动，tag 将指向 HEAD，发布的包可能包含未提交内容", flush=True)
+    version = next_version(latest.removeprefix("v"))
+    data = {"previous_tag": latest, "version": version,
             "build_time": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     output.mkdir(parents=True, exist_ok=True)
     (output / "version.json").write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -58,11 +87,22 @@ def prepare(root: Path, output: Path) -> dict:
     return data
 
 
+def push_tag(repo: Path, tag_name: str) -> tuple[bool, str]:
+    last_error = ""
+    for _ in range(PUSH_ATTEMPTS):
+        result = _run_git(repo, "push", "origin", tag_name, check=False)
+        if result.returncode == 0:
+            return True, ""
+        last_error = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+    return False, last_error
+
+
 def commit(root: Path, output: Path, release: Path) -> str:
+    repo = root.parent
     data = json.loads((output / "version.json").read_text(encoding="utf-8"))
-    version, previous = data["version"], data["previous_version"]
-    if next_version(previous) != version:
-        raise ValueError("invalid prepared version")
+    version = str(data.get("version", ""))
+    if TAG_RE.fullmatch(f"v{version}") is None:
+        raise ValueError(f"invalid prepared version: {version!r}")
     # 不允许把缺件或不同代次的目录记成已成功打包。
     for filename in ("mini-ide.exe", "mini-ide-cli.exe"):
         if not (release / filename).is_file() or not (release / filename).stat().st_size:
@@ -70,29 +110,24 @@ def commit(root: Path, output: Path, release: Path) -> str:
     bundled = release / "mini-ide-runtime" / "version.json"
     if json.loads(bundled.read_text(encoding="utf-8")) != data:
         raise ValueError("packaged version does not match prepared version")
-    path = root / "pyproject.toml"
-    current = read_version(root)
-    if current == version:
-        return version  # 同一完成步骤重试不重复加号。
-    if current != previous:
-        raise ValueError("source version changed during packaging")
-    original = path.read_bytes().decode("utf-8")
-    section = re.search(r"(?ms)^\[tool\.poetry\]\r?\n.*?(?=^\[|\Z)", original)
-    if section is None:
-        raise ValueError("missing tool.poetry section")
-    changed, count = re.subn(r'(?m)^(version\s*=\s*)[\'"]([^\'"\r\n]+)[\'"]',
-                            lambda match: match.group(1) + '"' + version + '"', section.group(), count=1)
-    if count != 1:
-        raise ValueError("missing source version")
-    updated = original[:section.start()] + changed + original[section.end():]
-    # 原子替换，保留 CRLF 和其余配置；写入失败不截断已有 pyproject。
-    fd, temporary = tempfile.mkstemp(prefix=".version-", suffix=".tmp", dir=root)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(updated.encode("utf-8"))
-        os.replace(temporary, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    tag_name = f"v{version}"
+    existing = _run_git(repo, "rev-parse", "--verify", f"{tag_name}^{{commit}}", check=False)
+    if existing.returncode == 0:
+        head = _run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        if existing.stdout.strip() == head:
+            return version  # 同一完成步骤重试不重复打 tag。
+        raise ValueError(f"tag {tag_name} 已存在且指向其他提交（可能另一台机器先发布），中止")
+    # 打包期间（包括另一台机器）出现了新 tag 就重打，防止版本号被占用。
+    if latest_version_tag(repo) != data.get("previous_tag"):
+        raise ValueError("打包期间仓库出现了新的版本 tag，请重新打包")
+    _run_git(repo, "tag", "-a", tag_name, "-m", f"mini-ide {tag_name}", "HEAD")
+    pushed, detail = push_tag(repo, tag_name)
+    if not pushed:
+        print(
+            f"[build] WARNING: tag 推送失败（{detail}）。"
+            f"请手动执行 git push origin {tag_name}，否则其他机器打包会重复这个版本号",
+            flush=True,
+        )
     return version
 
 
@@ -105,7 +140,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.action == "prepare":
         data = prepare(args.root, args.output)
-        print(f"[build] Version {data['previous_version']} -> {data['version']}", flush=True)
+        print(f"[build] Version {data['previous_tag']} -> {data['version']}", flush=True)
     else:
         if args.release is None:
             parser.error("commit requires --release")
