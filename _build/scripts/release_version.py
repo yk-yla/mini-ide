@@ -77,6 +77,9 @@ def prepare(root: Path, output: Path) -> dict:
     status = _run_git(repo, "status", "--porcelain", check=False).stdout
     if status.strip():
         print("[build] WARNING: 工作区有未提交改动，tag 将指向 HEAD，发布的包可能包含未提交内容", flush=True)
+    unpushed = _run_git(repo, "rev-list", "--count", "@{upstream}..HEAD", check=False)
+    if unpushed.returncode == 0 and unpushed.stdout.strip() not in {"", "0"}:
+        print("[build] WARNING: 有未推送的提交，tag 推送后其他机器可能找不到对应源码，请先 git push", flush=True)
     version = next_version(latest.removeprefix("v"))
     data = {"previous_tag": latest, "version": version,
             "build_time": datetime.now(timezone.utc).isoformat(timespec="seconds")}
