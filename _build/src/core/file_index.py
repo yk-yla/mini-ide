@@ -68,6 +68,7 @@ class FileIndexer(QObject):
     indexed = Signal(int)        # 扫描完成，参数=文件总数
     file_added = Signal(str)     # abs_path
     file_removed = Signal(str)
+    file_modified = Signal(str)
 
     def __init__(self, project_root: str, parent=None):
         super().__init__(parent)
@@ -187,7 +188,7 @@ class FileIndexer(QObject):
             return
         owner_ref = weakref.ref(self)
 
-        def on_change(path: str, added: bool) -> None:
+        def on_change(path: str, added: bool | None) -> None:
             owner = owner_ref()
             if owner is not None:
                 owner._on_fs_change(path, added)
@@ -222,7 +223,7 @@ class FileIndexer(QObject):
         """兼容旧调用方；实际启动始终异步。"""
         self._start_watchdog_async()
 
-    def _on_fs_change(self, path: str, added: bool) -> None:
+    def _on_fs_change(self, path: str, added: bool | None) -> None:
         if self._stopping:
             return
         try:
@@ -234,6 +235,9 @@ class FileIndexer(QObject):
         if _should_ignore(p, self.root, self._excluded_roots):
             return
         key = str(p)
+        if added is None:
+            self.file_modified.emit(key)
+            return
         with self._lock:
             if added:
                 if key in self._abs_set:
@@ -272,7 +276,7 @@ class _ObserverStopWorker(BackgroundThread):
 class _WatchdogStartWorker(BackgroundThread):
     ready = Signal(object)
 
-    def __init__(self, root: str, on_change: Callable[[str, bool], None], parent=None):
+    def __init__(self, root: str, on_change: Callable[[str, bool | None], None], parent=None):
         super().__init__(parent)
         self._root = root
         self._on_change = on_change
@@ -313,6 +317,10 @@ class _WatchdogStartWorker(BackgroundThread):
             def on_deleted(self, event):
                 if not event.is_directory:
                     callback(event.src_path, False)
+
+            def on_modified(self, event):
+                if not event.is_directory:
+                    callback(event.src_path, None)
 
             def on_moved(self, event):
                 if not event.is_directory:

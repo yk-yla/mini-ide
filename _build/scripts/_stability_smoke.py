@@ -71,7 +71,9 @@ def editing_checks(app):
     pane.view.document().setModified(False)
     path.write_bytes("中文\r\n第二行".encode("utf-16"))
     pane._try_external_reload()
-    assert not pane.view.isReadOnly() and pane._encoding.startswith("utf-16")
+    assert pane.view.isReadOnly() and pane._encoding.startswith("utf-16")
+    pane.btn_edit.click()
+    assert not pane.view.isReadOnly()
     pane.view.insertPlainText("修改")
     assert pane.flush_save()
     saved = path.read_bytes().decode("utf-16")
@@ -234,6 +236,7 @@ def quit_child(mode):
     assert tab is not None
     tab._show_preview(str(path), 0, 0)
     pane = next(iter(tab._file_panes.values()))
+    pane.btn_edit.click()
     pane.view.insertPlainText("edited")
     worker = SlowWorker(tab)
     results, at_quit = [], []

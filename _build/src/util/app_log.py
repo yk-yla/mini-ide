@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
+import re
 import sys
 import threading
 import time
@@ -124,14 +125,20 @@ def log_path_today() -> Path:
 
 # ---- 内部 ----
 
-def _prune_old_logs(keep_days: int) -> None:
+def _prune_old_logs(keep_days: int = 14) -> None:
     cutoff = datetime.now() - timedelta(days=keep_days)
-    for f in _log_dir().glob("mini-ide-*.log*"):
-        try:
-            if datetime.fromtimestamp(f.stat().st_mtime) < cutoff:
-                f.unlink(missing_ok=True)
-        except OSError:
-            pass
+    try:
+        for path in _log_dir().iterdir():
+            if path.suffix.lower() != ".log" and not re.fullmatch(r"mini-ide-.*\.log\.\d+", path.name):
+                continue
+            try:
+                if (not path.is_symlink() and path.is_file()
+                        and datetime.fromtimestamp(path.stat().st_mtime) < cutoff):
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _install_excepthook(logger: logging.Logger) -> None:

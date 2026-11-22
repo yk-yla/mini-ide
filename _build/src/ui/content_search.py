@@ -9,9 +9,14 @@ from src.core.search_worker_lifecycle import BackgroundThread, background_tasks_
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import base64
+import json
 import logging
 import os
 import re
+import shutil
+import subprocess
+from threading import Lock
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,8 +33,9 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.aggregate_workspace import is_scan_path_excluded, scan_exclusion_roots
-from src.core.file_index import FileIndexer, IGNORED_EXTS, prune_scan_dirnames
+from src.core.file_index import FileIndexer, IGNORED_DIRS, IGNORED_EXTS, prune_scan_dirnames
 from src.core.search_worker_lifecycle import register_search_worker
+from src.core.tool_launchers import CREATE_NO_WINDOW
 from src.ui.theme import (
     FG_BRIGHT, FG_DIM, FG_PRIMARY, FG_SECONDARY, HIGHLIGHT_MATCH_BG,
     HIGHLIGHT_MATCH_FG, apply_search_style,
@@ -91,6 +97,17 @@ class ContentMatch:
     line_text: str
     col_start: int
     col_end: int
+    component: str = ""
+
+
+def _rg_text(field: dict) -> str:
+    if "text" in field:
+        return field["text"]
+    return base64.b64decode(field["bytes"]).decode("utf-8", errors="replace")
+
+
+def _literal_glob(text: str) -> str:
+    return "".join(f"[{char}]" if char in "*?[]{}" else char for char in text)
 
 
 class SearchWorker(BackgroundThread):
@@ -99,19 +116,26 @@ class SearchWorker(BackgroundThread):
     done = Signal(int, int)      # total_files_scanned, total_matches
     stopped = Signal()
     files_collected = Signal(list)  # list[str]：本次 walk 收集到的候选文件清单（供 dialog 缓存）
+    root_files_collected = Signal(str, list)
 
-    def __init__(self, root: str, query: str, case_sensitive: bool,
-                 whole_word: bool, use_regex: bool, include_exts: list[str],
+    def __init__(self, root: str = "", query: str = "", case_sensitive: bool = False,
+                 whole_word: bool = False, use_regex: bool = False, include_exts: list[str] | None = None,
                  file_list: list[str] | None = None, include_noise: bool = False,
-                 parent=None):
+                 parent=None, *, roots: list[tuple[str, str]] | None = None,
+                 file_lists: dict[str, list[str]] | None = None):
         super().__init__(parent)
         self.root = root
-        self.excluded_roots = scan_exclusion_roots(root)
+        self.roots = tuple(roots) if roots is not None else ((("", root),) if root else ())
+        self.excluded_roots = None
+        self.component = ""
+        self._scanned = 0
+        self._total = 0
+        self._limit = MAX_MATCHES
         self.query = query
         self.case = case_sensitive
         self.whole_word = whole_word
         self.regex = use_regex
-        self.include_exts = {e.lower() for e in include_exts if e}
+        self.include_exts = {e.lower() for e in (include_exts or ()) if e}
         # 是否把日志/压缩产物/lock 等噪音文件纳入搜索（默认 False，顶部勾选放开）
         self.include_noise = include_noise
         # 复用上一次扫描缓存的候选文件清单：非 None 时跳过 os.walk + stat，直接 grep。
@@ -119,7 +143,11 @@ class SearchWorker(BackgroundThread):
         # 注意：清单里含噪音文件，是否搜它们由 include_noise 在 grep 阶段决定，
         # 这样切换"含日志"开关无需重新 walk。
         self.file_list = file_list
+        self._file_lists = file_lists or {}
         self._stop = False
+        self._process_lock = Lock()
+        self._process = None
+        self._rg_emitted: set[tuple[str, int]] = set()
         self._literal_needle: bytes | None = None
         if not use_regex:
             # 大小写敏感文本可直接按 UTF-8 预筛；中文、数字等没有大小写
@@ -130,20 +158,177 @@ class SearchWorker(BackgroundThread):
 
     def stop(self) -> None:
         self._stop = True
+        with self._process_lock:
+            self._kill_process(self._process)
+
+    @staticmethod
+    def _kill_process(process) -> None:
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
 
     def run(self) -> None:
+        if self._stop:
+            self.stopped.emit()
+            return
         try:
             pattern = _compile_pattern(self.query, self.case, self.whole_word, self.regex)
         except re.error:
             self.done.emit(0, 0)
             return
 
-        if self.file_list is not None:
-            self._run_cached(pattern)
+        executable = shutil.which("rg")
+        for component, path in self.roots:
+            if self._stop or self._total >= MAX_MATCHES:
+                break
+            self.component = component
+            self.root = os.path.abspath(path)
+            if component or self.excluded_roots is None:
+                self.excluded_roots = scan_exclusion_roots(self.root)
+            if component:
+                self.file_list = self._file_lists.get(component)
+            self._rg_emitted.clear()
+            self._limit = MAX_MATCHES - self._total
+            result = self._run_rg(executable, pattern) if executable else None
+            if self._stop:
+                break
+            if result is None:
+                result = self._run_cached(pattern) if self.file_list is not None else self._run_walk(pattern)
+            self._scanned += result[0]
+            self._total += result[1]
+        if self._stop:
+            self.stopped.emit()
         else:
-            self._run_walk(pattern)
+            self.done.emit(self._scanned, self._total)
 
-    def _grep_file(self, abs_p: Path, pattern, batch: list, scanned: int,
+    def _report_progress(self, scanned: int, total: int) -> None:
+        self.progress.emit(self._scanned + scanned, self._total + total)
+
+    def _rg_command(self, executable: str, root: Path) -> list[str]:
+        args = [
+            executable, "--json", "--no-config", "--no-ignore", "--hidden", "--text",
+            "--encoding", "none", "--crlf", "--line-buffered", "--max-filesize", str(MAX_FILE_SIZE),
+            "--case-sensitive" if self.case else "--ignore-case",
+        ]
+        if self.regex:
+            args.extend(("--engine", "auto"))
+            query = self.query
+        elif not self.case and any(char in self.query for char in "iIİı"):
+            query = re.sub("[iIİı]", "[iIİı]", re.escape(self.query))
+        else:
+            args.append("--fixed-strings")
+            query = self.query
+        for extension in sorted(self.include_exts):
+            args.extend(("--iglob", f"*{_literal_glob(extension)}"))
+        excluded_exts = IGNORED_EXTS if self.include_noise else IGNORED_EXTS | NOISE_EXTS
+        for extension in sorted(excluded_exts):
+            args.extend(("--iglob", f"!*{extension}"))
+        if not self.include_noise:
+            for name in sorted(NOISE_NAMES):
+                args.extend(("--iglob", f"!{name}"))
+        for name in sorted(IGNORED_DIRS):
+            args.extend(("--glob", f"!**/{name}/"))
+        for excluded in self.excluded_roots:
+            excluded = Path(os.path.abspath(excluded))
+            if excluded != root and excluded.is_relative_to(root):
+                glob = _literal_glob(excluded.relative_to(root).as_posix())
+                args.extend(("--iglob", f"!/{glob}/"))
+        args.extend(("-e", query, "--", "."))
+        return args
+
+    def _rg_match(self, data: dict, root: Path, pattern, candidates) -> ContentMatch | None:
+        path = Path(os.path.abspath(root / _rg_text(data["path"])))
+        if not path.is_relative_to(root) or is_scan_path_excluded(path, self.excluded_roots):
+            return None
+        if candidates is not None and os.path.normcase(str(path)) not in candidates:
+            return None
+        relative = path.relative_to(root)
+        parents = list(relative.parts[:-1])
+        prune_scan_dirnames(root, parents, (), allow_env=True)
+        if len(parents) != len(relative.parts) - 1:
+            return None
+        extension = path.suffix.lower()
+        if self.include_exts and extension not in self.include_exts:
+            return None
+        raw = _rg_text(data["lines"]).rstrip("\r\n")
+        match = pattern.search(raw)
+        if match is None:
+            return None
+        shown = raw if len(raw) <= MAX_LINE_LEN else raw[:MAX_LINE_LEN] + "…"
+        return ContentMatch(str(path), relative.as_posix(), data["line_number"],
+                            shown, match.start(), match.end(), self.component)
+
+    def _run_rg(self, executable: str, pattern) -> tuple[int, int] | None:
+        root = Path(os.path.abspath(self.root))
+        candidates = None
+        if self.file_list is not None:
+            candidates = set()
+            for path in self.file_list:
+                if self._stop:
+                    return None
+                candidates.add(os.path.normcase(os.path.abspath(path)))
+            if not candidates:
+                return 0, 0
+        if is_scan_path_excluded(root, self.excluded_roots):
+            return 0, 0
+        process = None
+        batch = []
+        seen_files = set()
+        scanned = None
+        try:
+            process = subprocess.Popen(
+                self._rg_command(executable, root), cwd=root,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            with self._process_lock:
+                self._process = process
+                if self._stop:
+                    self._kill_process(process)
+            for line in process.stdout:
+                if self._stop:
+                    break
+                message = json.loads(line)
+                data = message["data"]
+                if message["type"] == "summary":
+                    scanned = data["stats"]["searches"]
+                elif message["type"] == "match":
+                    hit = self._rg_match(data, root, pattern, candidates)
+                    if hit is None:
+                        continue
+                    seen_files.add(hit.abs_path)
+                    batch.append(hit)
+                    total = len(self._rg_emitted) + len(batch)
+                    if total == 1 or len(batch) >= 30 or total == self._limit:
+                        self._emit_rg_batch(batch)
+                        batch = []
+                        self._report_progress(len(seen_files), total)
+                    if total == self._limit:
+                        return len(seen_files), total
+            if self._stop:
+                return None
+            if process.wait() in (0, 1) and scanned is not None:
+                self._emit_rg_batch(batch)
+                return max(scanned, len(seen_files)), len(self._rg_emitted)
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        finally:
+            if process is not None:
+                with self._process_lock:
+                    self._process = None
+                    self._kill_process(process)
+                process.stdout.close()
+                process.wait()
+        return None
+
+    def _emit_rg_batch(self, batch: list[ContentMatch]) -> None:
+        if batch:
+            self._rg_emitted.update((os.path.normcase(hit.abs_path), hit.line_no) for hit in batch)
+            self.match_found.emit(batch)
+
+    def _grep_file(self, abs_p: Path, pattern, batch: list,
                    total: int) -> tuple[int, bool]:
         """grep 单个文件，命中追加到 batch。返回 (新增命中数, 是否达上限)。"""
         rel = str(abs_p.relative_to(self.root)).replace("\\", "/")
@@ -153,16 +338,18 @@ class SearchWorker(BackgroundThread):
                 for ln, line in enumerate(f, 1):
                     if self._stop:
                         return added, False
+                    if self._rg_emitted and (os.path.normcase(str(abs_p)), ln) in self._rg_emitted:
+                        continue
                     raw = line.rstrip("\r\n")
                     for m in pattern.finditer(raw):
                         text = raw if len(raw) <= MAX_LINE_LEN else raw[:MAX_LINE_LEN] + "…"
                         batch.append(ContentMatch(
                             abs_path=str(abs_p), rel_path=rel,
                             line_no=ln, line_text=text,
-                            col_start=m.start(), col_end=m.end(),
+                            col_start=m.start(), col_end=m.end(), component=self.component,
                         ))
                         added += 1
-                        if total + added >= MAX_MATCHES:
+                        if total + added >= self._limit:
                             return added, True
                         break   # 一行只记一次，减少噪音
         except OSError:
@@ -195,6 +382,8 @@ class SearchWorker(BackgroundThread):
         for line_no, line in enumerate(text.splitlines(), 1):
             if self._stop:
                 return []
+            if self._rg_emitted and (os.path.normcase(path), line_no) in self._rg_emitted:
+                continue
             match = pattern.search(line)
             if match is None:
                 continue
@@ -202,20 +391,21 @@ class SearchWorker(BackgroundThread):
             matches.append(ContentMatch(
                 abs_path=str(abs_p), rel_path=rel,
                 line_no=line_no, line_text=shown,
-                col_start=match.start(), col_end=match.end(),
+                col_start=match.start(), col_end=match.end(), component=self.component,
             ))
+            if len(matches) >= self._limit:
+                break
         return matches
 
-    def _run_cached(self, pattern) -> None:
+    def _run_cached(self, pattern) -> tuple[int, int]:
         """走缓存清单：无 os.walk / stat，逐个文件 grep。"""
         scanned = 0
-        total = 0
+        total = len(self._rg_emitted)
         batch: list[ContentMatch] = []
         candidates: list[str] = []
         for path in self.file_list:
             if self._stop:
-                self.stopped.emit()
-                return
+                return scanned, total
             if is_scan_path_excluded(path, self.excluded_roots):
                 continue
             fn = Path(path).name
@@ -241,44 +431,41 @@ class SearchWorker(BackgroundThread):
             ):
                 if self._stop:
                     executor.shutdown(wait=True, cancel_futures=True)
-                    self.stopped.emit()
-                    return
+                    return scanned, total
                 scanned += 1
-                remaining = MAX_MATCHES - total
+                remaining = self._limit - total
                 if matches:
                     batch.extend(matches[:remaining])
                     total += min(len(matches), remaining)
-                if total >= MAX_MATCHES:
+                if total >= self._limit:
                     if batch:
                         self.match_found.emit(batch)
-                    self.done.emit(scanned, total)
-                    return
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    return scanned, total
                 if len(batch) >= 30:
                     self.match_found.emit(batch)
                     batch = []
                 if scanned % 100 == 0:
-                    self.progress.emit(scanned, total)
+                    self._report_progress(scanned, total)
         if batch:
             self.match_found.emit(batch)
-        self.done.emit(scanned, total)
+        return scanned, total
 
-    def _run_walk(self, pattern) -> None:
+    def _run_walk(self, pattern) -> tuple[int, int]:
         collected: list[str] = []
         scanned = 0
-        total = 0
+        total = len(self._rg_emitted)
         batch: list[ContentMatch] = []
 
         for dirpath, dirnames, filenames in os.walk(self.root):
             if self._stop:
-                self.stopped.emit()
-                return
+                return scanned, total
             prune_scan_dirnames(
                 Path(dirpath), dirnames, self.excluded_roots, allow_env=True,
             )
             for fn in filenames:
                 if self._stop:
-                    self.stopped.emit()
-                    return
+                    return scanned, total
                 ext = Path(fn).suffix.lower()
                 if ext in IGNORED_EXTS:
                     continue
@@ -296,26 +483,28 @@ class SearchWorker(BackgroundThread):
                 if self.include_exts and ext not in self.include_exts:
                     continue
                 scanned += 1
-                added, capped = self._grep_file(abs_p, pattern, batch, scanned, total)
+                added, capped = self._grep_file(abs_p, pattern, batch, total)
                 total += added
                 if capped:
                     self.match_found.emit(batch)
-                    self.done.emit(scanned, total)
-                    return
+                    return scanned, total
 
                 if len(batch) >= 30:
                     self.match_found.emit(batch)
                     batch = []
-                    self.progress.emit(scanned, total)
+                    self._report_progress(scanned, total)
             if len(batch) >= 10:
                 self.match_found.emit(batch)
                 batch = []
-                self.progress.emit(scanned, total)
+                self._report_progress(scanned, total)
 
         if batch:
             self.match_found.emit(batch)
-        self.files_collected.emit(collected)
-        self.done.emit(scanned, total)
+        if self.component:
+            self.root_files_collected.emit(self.component, collected)
+        else:
+            self.files_collected.emit(collected)
+        return scanned, total
 
 
 
@@ -397,14 +586,17 @@ class ContentSearchDialog(QDialog):
     """全项目内容搜索对话框"""
 
     open_requested = Signal(str, int, int)   # abs_path, line, col
+    component_open_requested = Signal(str, str, int, int)
 
-    def __init__(self, project_root: str, parent=None,
-                 indexer: FileIndexer | None = None):
+    def __init__(self, project_root: str = "", parent=None,
+                 indexer: FileIndexer | None = None, *, roots: list[tuple[str, str]] | None = None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.root = project_root
+        self.roots = roots
         self.indexer = indexer
-        self.setWindowTitle(f"在项目中搜索   (Ctrl+Shift+F)   —   {project_root}")
+        title = f"跨仓全文搜索 · {len(roots)} 个项目" if roots is not None else f"在项目中搜索   —   {project_root}"
+        self.setWindowTitle(f"{title}   (Ctrl+Shift+F)")
         self.resize(1100, 700)
 
         self._worker: SearchWorker | None = None
@@ -412,6 +604,7 @@ class ContentSearchDialog(QDialog):
         # 整项目候选文件清单缓存：首次搜索 walk 时填充，之后同会话内复用，
         # 避免每次输入都重新遍历目录树 + stat（大仓库下这是卡顿主因）
         self._file_cache: list[str] | None = None
+        self._root_file_cache: dict[str, list[str]] = {}
         self._render_queue: deque[ContentMatch] = deque()
         self._pending_terminal: tuple[str, int, int] | None = None
         self._discard_results = False
@@ -430,6 +623,10 @@ class ContentSearchDialog(QDialog):
 
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(10, 10, 10, 10)
+        if roots is not None:
+            scope = QLabel(f"跨仓全文搜索 · {len(roots)} 个项目")
+            scope.setToolTip("\n".join(f"[{component}] {path}" for component, path in roots))
+            root_lay.addWidget(scope)
 
         # 查询输入
         top = QHBoxLayout()
@@ -596,12 +793,14 @@ class ContentSearchDialog(QDialog):
             include_exts=exts, file_list=file_list,
             include_noise=self.chk_noise.isChecked(),
             parent=QApplication.instance(),
+            roots=self.roots, file_lists=dict(self._root_file_cache),
         )
         self._worker.match_found.connect(self._on_matches)
         self._worker.progress.connect(self._on_progress)
         self._worker.done.connect(self._on_done)
         self._worker.stopped.connect(self._on_stopped)
         self._worker.files_collected.connect(self._on_files_collected)
+        self._worker.root_files_collected.connect(self._on_root_files_collected)
         register_search_worker(self._worker, self._worker.stop)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
@@ -611,6 +810,10 @@ class ContentSearchDialog(QDialog):
             return
         # 仅首次 walk 的 worker 会发这个信号；缓存住供后续输入复用
         self._file_cache = files
+
+    def _on_root_files_collected(self, component: str, files: list) -> None:
+        if self.sender() is self._worker:
+            self._root_file_cache[component] = files
 
     def _stop_search(self, restart: bool = False) -> None:
         if self._worker and self._worker.isRunning():
@@ -656,10 +859,11 @@ class ContentSearchDialog(QDialog):
         self.tree.setUpdatesEnabled(False)
         try:
             for match in batch:
-                parent = self._file_items.get(match.rel_path)
+                result_path = f"[{match.component}] {match.rel_path}" if match.component else match.rel_path
+                parent = self._file_items.get(result_path)
                 if parent is None:
                     path = Path(match.rel_path)
-                    parent_dir = str(path.parent).replace("\\", "/")
+                    parent_dir = result_path if match.component else path.parent.as_posix()
                     if parent_dir == ".":
                         parent_dir = ""
                     parent = QTreeWidgetItem([f"📄  {path.name}", parent_dir])
@@ -670,22 +874,22 @@ class ContentSearchDialog(QDialog):
                     parent.setForeground(0, QColor(str(FG_PRIMARY)))
                     parent.setForeground(1, QColor(str(FG_SECONDARY)))
                     parent.setToolTip(0, match.abs_path)
-                    parent.setToolTip(1, match.rel_path)
+                    parent.setToolTip(1, result_path)
                     self.tree.addTopLevelItem(parent)
                     parent.setExpanded(True)
-                    self._file_items[match.rel_path] = parent
-                    self._file_counts[match.rel_path] = 0
-                    self._file_dirs[match.rel_path] = parent_dir
+                    self._file_items[result_path] = parent
+                    self._file_counts[result_path] = 0
+                    self._file_dirs[result_path] = parent_dir
                 child = QTreeWidgetItem([f"   L {match.line_no}", match.line_text])
                 child.setData(
                     0, Qt.ItemDataRole.UserRole,
-                    (match.abs_path, match.line_no, match.col_start),
+                    (match.component, match.abs_path, match.line_no, match.col_start),
                 )
                 child.setForeground(0, QColor(str(FG_DIM)))
                 child.setForeground(1, QColor(str(FG_PRIMARY)))
                 parent.addChild(child)
-                self._file_counts[match.rel_path] += 1
-                touched.add(match.rel_path)
+                self._file_counts[result_path] += 1
+                touched.add(result_path)
             for rel_path in touched:
                 parent = self._file_items[rel_path]
                 directory = self._file_dirs[rel_path]
@@ -754,8 +958,11 @@ class ContentSearchDialog(QDialog):
     def _on_activate(self, item: QTreeWidgetItem, _col: int) -> None:
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if data:
-            path, line, col = data
-            self.open_requested.emit(path, line, col)
+            component, path, line, col = data
+            if component:
+                self.component_open_requested.emit(component, path, line, col)
+            else:
+                self.open_requested.emit(path, line, col)
 
     def closeEvent(self, e):
         self._pending_restart = False

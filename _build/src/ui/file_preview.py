@@ -1,7 +1,7 @@
 """内嵌文件编辑/预览面板（tab 内容）
 
 作为 ProjectTab 中心 QTabWidget 里的一个 tab 页内容。
-- 默认直接进入编辑模式（无模式切换按钮）
+- 默认只读预览，可解锁编辑并在保存后重新锁定
 - Pygments 语法高亮、行号、当前行高亮、跳行定位、搜索 Ctrl+F
 - 每次输入后 3s 自动保存；Ctrl+S 立即保存
 - 二进制 / >2MB / 读取失败：自动切只读并在状态条提示原因
@@ -44,6 +44,8 @@ from src.core.file_preview_model import (
     line_comment_prefix, should_wrap_text,
 )
 from src.core.search_worker_lifecycle import BackgroundThread, background_tasks_suspended
+from src.core.usage_stats import usage_stats
+from src.ui.icons import icon
 from src.ui.syntax_highlighter import PygmentsHighlighter, get_lexer_for
 from src.ui.theme import (
     BG_CODE, BG_L2, BG_L4, BORDER_SUBTLE, COLOR_ERROR, COLOR_SUCCESS, COLOR_WARN,
@@ -359,9 +361,9 @@ class FilePreviewPane(QWidget):
         self._initial_col = column
         self._truncated = False
         self._binary = False
-        self._not_found = False
         self._dirty = False
-        self._read_only = False
+        self._editable = False
+        self._editing = False
         # 读文件时探测出的原始编码与行尾，保存时按原样回写，避免：
         #   1. 把 LF 文件整体改写成 CRLF（污染整文件 git diff）
         #   2. 把 GBK 等非 UTF-8 文件以 UTF-8 写回（内容不可逆损坏）
@@ -401,20 +403,26 @@ class FilePreviewPane(QWidget):
         self.lbl_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         top.addWidget(self.lbl_path, 1)
 
-        self.lbl_status = QLabel("编辑中")
+        self.lbl_status = QLabel("只读预览")
         self.lbl_status.setStyleSheet(f"color:{FG_SECONDARY}; padding:0 8px;")
         top.addWidget(self.lbl_status)
 
-        btn_external = QPushButton("外部编辑器")
-        btn_external.setToolTip("用 VS Code / IDEA / Notepad++ 打开")
-        btn_external.clicked.connect(self._open_external)
-        top.addWidget(btn_external)
+        self.btn_edit = QPushButton("解锁编辑")
+        self.btn_edit.hide()
+        self.btn_edit.clicked.connect(self._toggle_edit_mode)
+        top.addWidget(self.btn_edit)
 
-        btn_reveal = QToolButton()
-        btn_reveal.setText("📁")
-        btn_reveal.setToolTip(REVEAL_LABEL)
-        btn_reveal.clicked.connect(lambda: reveal_in_explorer(self.path))
-        top.addWidget(btn_reveal)
+        self.btn_external = QPushButton("外部编辑器")
+        self.btn_external.setToolTip("用 VS Code / IDEA / Notepad++ 打开")
+        self.btn_external.clicked.connect(self._open_external)
+        top.addWidget(self.btn_external)
+
+        self.btn_reveal = QToolButton()
+        self.btn_reveal.setAccessibleName(REVEAL_LABEL)
+        self.btn_reveal.setToolTip(REVEAL_LABEL)
+        self.btn_reveal.clicked.connect(lambda: reveal_in_explorer(self.path))
+        top.addWidget(self.btn_reveal)
+        self._refresh_toolbar_icons()
 
         root.addLayout(top)
 
@@ -441,6 +449,7 @@ class FilePreviewPane(QWidget):
 
         # 编辑器
         self.view = CodeView()
+        self.view.setReadOnly(True)
         self.view.document().modificationChanged.connect(self._on_modified)
         self.view.textChanged.connect(self._on_text_changed)
         self.view.textChanged.connect(self._schedule_search_status)
@@ -452,22 +461,18 @@ class FilePreviewPane(QWidget):
         self._autosave_timer.timeout.connect(self._autosave)
 
         # 外部修改监听（AI / 外部编辑器改了文件时自动重载）
-        # 自保存触发的 fileChanged 用 _ignore_external_until 时间戳过滤
         self._watcher = QFileSystemWatcher(self)
         self._watcher.fileChanged.connect(self._on_external_changed)
         self._extreload_timer = QTimer(self)
         self._extreload_timer.setSingleShot(True)
         self._extreload_timer.timeout.connect(self._try_external_reload)
-        self._ignore_external_until = 0.0
 
         # 快捷键：Ctrl+F 搜索、Ctrl+S 保存。
         # Ctrl+W 交给外层 ProjectTab 处理，不在此注册，避免冲突
         self._register_shortcuts()
 
         self._load()
-        if line > 0 and not self._read_only:
-            self.view.goto_line(line, column)
-        elif line > 0:
+        if line > 0:
             self.view.goto_line(line, column)
 
     # ---- 对外接口 ----
@@ -477,8 +482,16 @@ class FilePreviewPane(QWidget):
 
     def refresh_theme(self) -> None:
         self.view.refresh_theme()
+        self._refresh_toolbar_icons()
+        self.lbl_path.setStyleSheet(f"color:{FG_SECONDARY};")
+        self.lbl_search_status.setStyleSheet(f"color:{FG_SECONDARY};")
         if self._highlighter is not None:
             self._highlighter.refresh_theme()
+
+    def _refresh_toolbar_icons(self) -> None:
+        self.btn_edit.setIcon(icon("lock" if self._editing else "edit"))
+        self.btn_external.setIcon(icon("external_link"))
+        self.btn_reveal.setIcon(icon("folder_open"))
 
     def is_dirty(self) -> bool:
         return self._dirty
@@ -491,7 +504,7 @@ class FilePreviewPane(QWidget):
         返回 True 表示已干净或成功保存；False 表示仍 dirty（保存失败）
         """
         self._autosave_timer.stop()
-        if self._dirty and not self._read_only:
+        if self._dirty and self._editing:
             self._autosave()
         return not self._dirty
 
@@ -516,7 +529,6 @@ class FilePreviewPane(QWidget):
     def _load(self) -> None:
         p = Path(self.path)
         if not p.exists():
-            self._not_found = True
             self._set_readonly_reason(f"(文件不存在) {self.path}", f"文件不存在\n\n{self.path}")
             return
         image_format = _image_format_for(p)
@@ -551,6 +563,9 @@ class FilePreviewPane(QWidget):
                     "文件过大或单行过长，只读显示前部，已禁止覆盖保存",
                     None,
                 )
+            else:
+                self._editable = True
+                self._set_edit_mode(False)
         except OSError as e:
             self._set_readonly_reason(f"读取失败：{e}", f"(读取失败)\n\n{e}")
             log.error("预览读取失败: %s | %s", self.path, e)
@@ -570,10 +585,8 @@ class FilePreviewPane(QWidget):
         if should_wrap_text(p):
             self.view.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
 
-        # 注册外部修改监听（只监听存在、可编辑的常规文本文件）
-        if not self._not_found and not self._binary:
-            if self.path not in self._watcher.files():
-                self._watcher.addPath(self.path)
+        if self.path not in self._watcher.files():
+            self._watcher.addPath(self.path)
 
     def _load_image(self, p: Path, image_format: str) -> None:
         self._binary = True
@@ -594,7 +607,6 @@ class FilePreviewPane(QWidget):
                 movie = QMovie(self)
                 log.warning("动图读取失败: %s | %s", self.path, e)
             if movie.isValid():
-                self._read_only = True
                 self.search_widget.setVisible(False)
                 self.view.setVisible(False)
                 self._build_image_area()
@@ -618,7 +630,6 @@ class FilePreviewPane(QWidget):
             log.warning("图片预览失败: %s | %s", self.path, reader.errorString())
             return
 
-        self._read_only = True
         self.search_widget.setVisible(False)
         self.view.setVisible(False)
         self._build_image_area()
@@ -720,14 +731,33 @@ class FilePreviewPane(QWidget):
         self._fit_image_to_view()
 
     def _set_readonly_reason(self, reason: str, body_text: str | None) -> None:
-        self._read_only = True
-        self.view.setReadOnly(True)
+        self._editable = False
+        self._set_edit_mode(False)
         if body_text is not None:
             self.view.setPlainText(body_text)
         self.lbl_status.setText(reason)
         self.lbl_status.setStyleSheet(f"color:{COLOR_WARN}; padding:0 8px;")
 
     # ---- 编辑 / 保存 ----
+
+    def _set_edit_mode(self, editing: bool) -> None:
+        self._editing = editing
+        self.view.setReadOnly(not editing)
+        self.btn_edit.setVisible(self._editable)
+        self.btn_edit.setText("锁定只读" if editing else "解锁编辑")
+        self.btn_edit.setIcon(icon("lock" if editing else "edit"))
+        self._restore_status_label()
+
+    def _toggle_edit_mode(self) -> None:
+        if not self._editable:
+            return
+        if self._editing:
+            if self.flush_save():
+                self._set_edit_mode(False)
+            return
+        self._set_edit_mode(True)
+        self.view.setFocus()
+        usage_stats.record_gui("file:unlock_edit")
 
     def _on_modified(self, dirty: bool) -> None:
         if dirty == self._dirty:
@@ -736,7 +766,7 @@ class FilePreviewPane(QWidget):
         self.dirtyChanged.emit(dirty)
 
     def _on_text_changed(self) -> None:
-        if self._read_only or self._truncated or self._binary:
+        if not self._editing:
             return
         self._autosave_timer.start(_AUTOSAVE_DELAY_MS)
 
@@ -783,14 +813,12 @@ class FilePreviewPane(QWidget):
         self._disk_signature = self._signature(path)
 
     def _autosave(self) -> None:
-        if not self._dirty or self._read_only:
+        if not self._dirty or not self._editing:
             return
         try:
             p = Path(self.path)
             tmp = p.with_suffix(p.suffix + ".minitmp")
             self._write_text_preserving(tmp, self.view.toPlainText())
-            # 设忽略窗口：watcher 接下来 1 秒内的 fileChanged 是我们自己写的，不要触发重载
-            self._ignore_external_until = time.monotonic() + 1.0
             self._replace_saved_file(tmp, p)
             self.view.document().setModified(False)
             self._dirty = False
@@ -806,18 +834,17 @@ class FilePreviewPane(QWidget):
             self.lbl_status.setStyleSheet(f"color:{COLOR_ERROR}; padding:0 8px;")
 
     def _restore_status_label(self) -> None:
-        if not self._read_only:
-            self.lbl_status.setText("编辑中")
+        if self._editable:
+            self.lbl_status.setText("编辑中" if self._editing else "只读预览")
             self.lbl_status.setStyleSheet(f"color:{FG_SECONDARY}; padding:0 8px;")
 
     def _save(self) -> None:
-        if self._read_only or not self._dirty:
+        if not self._editing or not self._dirty:
             return
         p = Path(self.path)
         try:
             tmp = p.with_suffix(p.suffix + ".minitmp")
             self._write_text_preserving(tmp, self.view.toPlainText())
-            self._ignore_external_until = time.monotonic() + 1.0
             self._replace_saved_file(tmp, p)
             self.view.document().setModified(False)
             self._dirty = False
@@ -834,13 +861,11 @@ class FilePreviewPane(QWidget):
         """QFileSystemWatcher 回调。debounce 200ms 后再读，避免 VSCode
         '删除-重命名'保存路径瞬间读到空文件。
         """
-        if time.monotonic() < self._ignore_external_until:
-            return
         self._extreload_timer.start(_EXTRELOAD_DEBOUNCE_MS)
 
     def _try_external_reload(self) -> None:
-        if self._binary or (self._read_only and not self._not_found and not self._truncated):
-            return  # 只读（二进制 / 过大 / 读取失败）不参与重载
+        if self._binary or not (self._editable or self._truncated):
+            return
         p = Path(self.path)
         if not p.exists():
             # 某些编辑器是"删除-重命名"，文件可能正处于中间态，再 debounce 一次
@@ -852,6 +877,11 @@ class FilePreviewPane(QWidget):
             self._watcher.addPath(self.path)
 
         if self._dirty:
+            try:
+                if self._signature(p) == self._disk_signature:
+                    return
+            except OSError:
+                return
             # 方案 B：本地有未保存改动，不覆盖；状态条提示用户自己处理
             self.lbl_status.setText("⚠ 外部已修改，本地有未保存改动")
             self.lbl_status.setStyleSheet(f"color:{COLOR_WARN}; padding:0 8px;")
@@ -882,11 +912,10 @@ class FilePreviewPane(QWidget):
 
         self._autosave_timer.stop()
         self._truncated = truncated
-        self._read_only = truncated
-        self._not_found = False
         self._disk_signature = signature
         self._encoding, self._newline = encoding, newline
-        self.view.setReadOnly(truncated)
+        self._editable = not truncated
+        self._set_edit_mode(self._editing and self._editable)
         self.view.setPlainText(text)
         self._autosave_timer.stop()
         self.view.document().setModified(False)
@@ -904,6 +933,8 @@ class FilePreviewPane(QWidget):
             self._set_readonly_reason("文件过大或单行过长，只读显示前部，已禁止覆盖保存", None)
             return
 
+        if not self._editing:
+            return
         self.lbl_status.setText(f"已自动重载 {time.strftime('%H:%M:%S')}")
         self.lbl_status.setStyleSheet(f"color:{COLOR_SUCCESS}; padding:0 8px;")
         QTimer.singleShot(1500, self._restore_status_label)

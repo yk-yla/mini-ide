@@ -32,9 +32,11 @@ from src.core.search_worker_lifecycle import register_search_worker
 from src.core.tool_launchers import (
     CREATE_NO_WINDOW, open_in_cc_args, open_in_codex_args,
 )
+from src.core.usage_stats import usage_stats
+from src.ui.icons import icon
 from src.ui.theme import (
     ACCENT_SUBTLE, BG_L2, BG_L4, FG_BRIGHT, FG_PRIMARY, GIT_ADD, GIT_CONFLICT,
-    GIT_DEL, GIT_IGNORED, GIT_MODIFY, apply_search_style,
+    GIT_DEL, GIT_IGNORED, GIT_MODIFY, GAP_XS, H_BTN_SM, apply_search_style,
 )
 from src.util.editor import REVEAL_LABEL, reveal_in_explorer
 
@@ -386,28 +388,35 @@ class FileTree(QWidget):
         tl.setContentsMargins(6, 4, 6, 4)
         tl.setSpacing(4)
         self.filter_input = QLineEdit()
-        self.filter_input.setPlaceholderText("过滤文件名（全项目）")
+        self.filter_input.setPlaceholderText("过滤文件…")
+        self.filter_input.setToolTip("按文件名过滤全项目")
+        self.filter_input.setMinimumWidth(124)
         apply_search_style(self.filter_input)
         self.filter_input.textChanged.connect(self._apply_filter)
         tl.addWidget(self.filter_input, 1)
 
         btn_refresh = QToolButton()
-        btn_refresh.setText("↻")
         btn_refresh.setToolTip("刷新文件树")
         btn_refresh.clicked.connect(self._reload)
         tl.addWidget(btn_refresh)
 
         btn_expand = QToolButton()
-        btn_expand.setText("＋")
         btn_expand.setToolTip("展开全部（谨慎，大项目可能慢）")
         btn_expand.clicked.connect(self._expand_all_safe)
         tl.addWidget(btn_expand)
 
         btn_collapse = QToolButton()
-        btn_collapse.setText("－")
         btn_collapse.setToolTip("折叠全部")
         btn_collapse.clicked.connect(lambda: self.tree.collapseAll())
         tl.addWidget(btn_collapse)
+        self._toolbar_icons = (
+            (btn_refresh, "refresh"), (btn_expand, "folder_open"), (btn_collapse, "folder"),
+        )
+        for button, glyph in self._toolbar_icons:
+            button.setFixedSize(H_BTN_SM + GAP_XS, H_BTN_SM + GAP_XS)
+            button.setProperty("compact", True)
+            button.setAccessibleName(button.toolTip())
+            button.setIcon(icon(glyph))
 
         root.addWidget(top)
 
@@ -468,6 +477,14 @@ class FileTree(QWidget):
 
     def refresh_theme(self) -> None:
         self.tree.setStyleSheet(_tree_style())
+        for button, glyph in self._toolbar_icons:
+            button.setIcon(icon(glyph))
+        pending = [self.tree.invisibleRootItem()]
+        while pending:
+            node = pending.pop()
+            if node.data(0, Qt.ItemDataRole.UserRole + 1) == "dir":
+                node.setIcon(0, icon("folder"))
+            pending.extend(node.child(index) for index in range(node.childCount()))
         self._render_loaded_git_nodes()
 
     def _render_loaded_git_nodes(self) -> None:
@@ -605,7 +622,8 @@ class FileTree(QWidget):
             for kind, name, abs_path in entries:
                 existing_names.add(name.lower())
                 if kind == "dir":
-                    node = QTreeWidgetItem(["📁  " + name])
+                    node = QTreeWidgetItem([name])
+                    node.setIcon(0, icon("folder"))
                     loading = QTreeWidgetItem(["(loading...)"])
                     loading.setData(0, Qt.ItemDataRole.UserRole + 1, "loading")
                     node.addChild(loading)
@@ -1348,12 +1366,16 @@ class FileTree(QWidget):
                 close_fds=True,
             )
         except OSError as e:
+            usage_stats.record_gui("external:codex", ok=False)
             QMessageBox.warning(self, "启动 open gpt 失败", f"{e}")
+        else:
+            usage_stats.record_gui("external:codex")
 
     def _open_cc(self, target_dir: Path) -> None:
         """在 AgentDesk 中为 cc 入口打开当前目录。"""
         command = open_in_cc_args(target_dir)
         if not command:
+            usage_stats.record_gui("external:cc", ok=False)
             QMessageBox.warning(
                 self, "启动 AgentDesk 失败",
                 "没有找到 AgentDesk，请先安装或配置 AGENTDESK_EXE。",
@@ -1367,7 +1389,10 @@ class FileTree(QWidget):
                 close_fds=True,
             )
         except OSError as e:
+            usage_stats.record_gui("external:cc", ok=False)
             QMessageBox.warning(self, "启动 AgentDesk 失败", f"{e}")
+        else:
+            usage_stats.record_gui("external:cc")
 
     def _create_new_file(self, target_dir: Path, default_ext: str = "") -> None:
         """在指定目录下新建文件。用户输入文件名，自动补 default_ext 后缀。"""

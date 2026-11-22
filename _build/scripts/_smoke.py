@@ -4,8 +4,11 @@
 任何 widget 文件里出现 #abcdef 这种字面量都会让冒烟失败。
 颜色必须来自 src/ui/theme.py 的 token。
 """
+import logging
+import os
 import re
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 
@@ -17,6 +20,7 @@ modules = [
     "src.core.app_version",
     "src.core.cli_contract",
     "src.core.cli_operations",
+    "src.core.usage_stats",
     "src.core.project_inspection",
     "src.core.run_logs",
     "src.core.config",
@@ -40,17 +44,17 @@ modules = [
     "src.core.external_detector",
     "src.core.nginx_detector",
     "src.ui.theme",
+    "src.ui.icons",
+    "src.ui.cockpit_panel",
     "src.ui.styles",
     "src.ui.log_widget",
     "src.ui.project_service_controller",
-    "src.ui.settings_panel",
     "src.ui.service_panel",
     "src.ui.project_tab",
     "src.ui.empty_state",
     "src.ui.aggregate_project_dialog",
     "src.ui.aggregate_project_tab",
     "src.ui.development_workspace_dialog",
-    "src.ui.workspace_review_dialog",
     "src.ui.file_tree",
     "src.ui.file_preview",
     "src.ui.syntax_highlighter",
@@ -156,6 +160,10 @@ def cli_parse_check() -> list[str]:
 
     cases = [
         (["mini-ide.exe", "--status"], {"cmd": "status"}),
+        (["mini-ide.exe", "--snapshot", "backend"],
+         {"cmd": "snapshot", "target": "backend", "tail": 60, "max_chars": 12000}),
+        (["mini-ide.exe", "--snapshot", "backend", "--tail", "2", "--max-chars", "100"],
+         {"cmd": "snapshot", "target": "backend", "tail": 2, "max_chars": 100}),
         (["mini-ide.exe", "--open", r"E:\demo"], {"cmd": "open", "path": r"E:\demo"}),
         (["mini-ide.exe", "--resolve-target", r"E:\demo"],
          {"cmd": "resolve-target", "path": r"E:\demo"}),
@@ -1880,6 +1888,273 @@ def file_preview_model_check() -> list[str]:
     return failed
 
 
+def usage_stats_check() -> list[str]:
+    import json
+    from unittest.mock import patch
+
+    from PySide6.QtNetwork import QLocalSocket
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    from src.core import cli_server
+    from src.core.cli_contract import parse_command
+    from src.core.cli_operations import OperationStore
+    from src.core.usage_stats import UsageStats
+
+    class Socket:
+        def __init__(self):
+            self.connected = True
+            self.response = None
+
+        def state(self):
+            return (QLocalSocket.LocalSocketState.ConnectedState if self.connected
+                    else QLocalSocket.LocalSocketState.UnconnectedState)
+
+        def write(self, payload):
+            self.response = json.loads(payload)
+
+        def flush(self):
+            pass
+
+        def disconnectFromServer(self):
+            self.connected = False
+
+    app = QApplication.instance() or QApplication([])
+    window = QWidget()
+    window._cli_operations = OperationStore()
+    settings = Path(os.environ["APPDATA"]) / "mini-ide" / "usage-stats.json"
+    assert UsageStats().path == settings
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "usage-stats.json"
+        stats = UsageStats(path)
+        events = []
+        unsubscribe = stats.add_listener(events.append)
+        stats.record_gui("file:unlock_edit", duration_ms=8)
+        stats.record_gui("file:unlock_edit", ok=False, duration_ms=12)
+        stats.record_gui("search:private-query")
+        for number in range(55):
+            stats.record_cli("git-ai-context", target=fr"D:\private-parent\repo-{number}",
+                             ok=False, duration_ms=5, error_code="private-error-text")
+        unsubscribe()
+        snapshot = stats.snapshot()
+        assert len(events) == 55 and len(snapshot["recent_ai_events"]) == 50
+        assert snapshot["recent_ai_events"][0]["target"] == "repo-5"
+        assert events[-1]["error_code"] == "operation_failed"
+        counter = snapshot["counters"]["gui"]["file:unlock_edit"]
+        assert counter["count"] == 2 and counter["fail_count"] == 1 and counter["total_ms"] == 20
+        assert stats.flush() and UsageStats(path).snapshot() == snapshot
+        assert not path.with_suffix(".json.tmp").exists()
+        assert "private" not in path.read_text(encoding="utf-8")
+        snapshot["counters"]["gui"].clear()
+        assert "file:unlock_edit" in stats.snapshot()["counters"]["gui"]
+        unavailable = UsageStats(path / "unavailable.json")
+        unavailable.record_gui("file:unlock_edit")
+        assert not unavailable.flush() and unavailable.snapshot()["counters"]["gui"]
+
+        def request(command):
+            sock = Socket()
+            assert cli_server.handle_cli_request(json.dumps(command), sock, window)
+            return sock
+
+        channels = []
+
+        def begin(_cmd, channel, _window):
+            channels.append(channel)
+            return True
+
+        with patch.object(cli_server, "usage_stats", stats):
+            query = parse_command(["--usage-stats"])
+            assert query == {"cmd": "usage-stats"}
+            response = request(query).response
+            assert response["ok"] and response["schema_version"] == 1
+            assert response["recent_ai_events"] == stats.snapshot()["recent_ai_events"]
+            with patch.object(cli_server, "_handle_async_cli_request", side_effect=begin):
+                command = parse_command([
+                    "--workspace-commit-push", r"D:\private-parent\project-alpha",
+                    "--message", "private-message", "--async", "--request-id", "private-id",
+                ])
+                receipt = request(command).response
+                assert receipt["accepted"] and request(command).response == receipt
+                assert len(channels) == 1 and "workspace-commit-push" not in stats.snapshot()["counters"]["cli"]
+                channels[0].finish({"ok": False, "error": "private-error", "code": "action_failed"})
+                channels[0].finish({"ok": True})
+                assert stats.snapshot()["counters"]["cli"]["workspace-commit-push"]["fail_count"] == 1
+
+                waiting = request(parse_command(["--compile", "project-beta"]))
+                assert waiting.response is None
+                channels[1].wait_expired()
+                assert waiting.response["code"] == "operation_wait_timeout"
+                assert "compile" not in stats.snapshot()["counters"]["cli"]
+                channels[1].finish({"ok": True, "output": "private-source"})
+                assert stats.snapshot()["counters"]["cli"]["compile"]["count"] == 1
+            lookup = request({"cmd": "operation", "operation_id": receipt["operation_id"]}).response
+            assert lookup["operation"]["status"] == "failed"
+
+        final = stats.snapshot()
+        assert final["counters"]["cli"]["workspace-commit-push"]["count"] == 1
+        assert final["counters"]["cli"]["operation"]["count"] == 1
+        assert final["recent_ai_events"][-3]["target"] == "project-alpha"
+        assert not any("private" in json.dumps(event) for event in final["recent_ai_events"])
+        assert len(events) == 55 and stats.flush()
+    window.deleteLater()
+    app.processEvents()
+    print("[OK]   usage statistics privacy, persistence, CLI snapshot and operation receipts", flush=True)
+    return []
+
+
+def file_preview_edit_mode_check() -> list[str]:
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from src.core.usage_stats import usage_stats
+    from src.ui.file_preview import FilePreviewPane, _MAX_LINE_CHARS
+
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "editable.ini"
+        path.write_text("name=value\n", encoding="utf-8")
+        pane = FilePreviewPane(str(path))
+        assert pane.view.isReadOnly() and pane.lbl_status.text() == "只读预览"
+        assert not pane.btn_edit.isHidden() and pane.btn_edit.text() == "解锁编辑"
+        pane.btn_edit.click()
+        assert not pane.view.isReadOnly() and pane.lbl_status.text() == "编辑中"
+        assert pane.btn_edit.text() == "锁定只读"
+        pane.view.keyPressEvent(QKeyEvent(
+            QKeyEvent.Type.KeyPress, Qt.Key.Key_Slash, Qt.KeyboardModifier.ControlModifier,
+        ))
+        assert pane.is_dirty() and pane._autosave_timer.isActive()
+        pane._save()
+        assert path.read_text(encoding="utf-8").startswith("# name=")
+        pane.view.insertPlainText("updated")
+        expected = pane.view.toPlainText()
+        pane.btn_edit.click()
+        assert pane.view.isReadOnly() and not pane.is_dirty()
+        assert path.read_text(encoding="utf-8") == expected
+        assert pane.lbl_status.text() == "只读预览"
+        path.write_text("external\n", encoding="utf-8")
+        for _ in range(100):
+            if pane.view.toPlainText() == "external\n":
+                break
+            QTest.qWait(20)
+        assert pane.view.toPlainText() == "external\n" and pane.lbl_status.text() == "只读预览"
+        pane.btn_edit.click()
+        pane.view.insertPlainText("local")
+        path.write_text("different external\n", encoding="utf-8")
+        pane.btn_edit.click()
+        assert not pane.view.isReadOnly() and pane.is_dirty() and "失败" in pane.lbl_status.text()
+        assert path.read_text(encoding="utf-8") == "different external\n"
+        assert usage_stats.snapshot()["counters"]["gui"]["file:unlock_edit"]["count"] >= 2
+
+        binary = root / "data.bin"
+        binary.write_bytes(b"\0\1\2")
+        long_line = root / "long.txt"
+        long_line.write_text("a" * (_MAX_LINE_CHARS + 1), encoding="utf-8")
+        for target in (binary, long_line, root / "missing.txt"):
+            readonly = FilePreviewPane(str(target))
+            assert readonly.btn_edit.isHidden()
+            readonly._toggle_edit_mode()
+            assert readonly.view.isReadOnly()
+            readonly.stop_workers()
+            readonly.deleteLater()
+        pane.stop_workers()
+        pane.deleteLater()
+        app.processEvents()
+    print("[OK]   preview unlock, save, relock, external reload and forced read-only", flush=True)
+    return []
+
+
+def log_retention_check() -> list[str]:
+    import time
+    from unittest.mock import patch
+
+    from src.util import app_log
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        old = {"mini-ide-old.log", "mini-ide-old.log.1", "service-old.log"}
+        preserved = {"service-recent.log", "settings.json", "mini-ide-old.log.notes", "folder.log"}
+        (root / "folder.log").mkdir()
+        (root / "folder.log" / "nested.log").touch()
+        timestamp = time.time() - 15 * 24 * 60 * 60
+        for filename in old | preserved | {"folder.log/nested.log"}:
+            path = root / filename
+            path.touch(exist_ok=True)
+            if filename != "service-recent.log":
+                os.utime(path, (timestamp, timestamp))
+        with patch.object(app_log, "_log_dir", return_value=root):
+            app_log._prune_old_logs()
+        assert {path.name for path in root.iterdir()} == preserved
+        assert (root / "folder.log" / "nested.log").exists()
+    print("[OK]   log retention prunes expired service logs and preserves other files", flush=True)
+    return []
+
+
+def project_git_refresh_check() -> list[str]:
+    from unittest.mock import patch
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from src.core.config import AppConfig, ProjectEntry
+    from src.core.project_detector import ProjectMeta
+    from src.ui import project_tab
+
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / ".git").mkdir()
+        with patch.object(project_tab.FileIndexer, "start_async_scan"):
+            tab = project_tab.ProjectTab(
+                ProjectMeta(tmp, "fixture", "generic", "临时仓库", ""),
+                ProjectEntry(tmp), AppConfig(),
+            )
+        tab._poll_start_timer.stop()
+        tab._fetch_start_timer.stop()
+        with (patch.object(tab, "isVisible", return_value=True) as visible,
+              patch.object(QApplication, "applicationState") as state,
+              patch.object(project_tab.time, "monotonic") as clock,
+              patch.object(project_tab, "GitStatusWorker") as worker,
+              patch.object(tab, "_refresh_status_row") as services):
+            active = Qt.ApplicationState.ApplicationActive
+            state.return_value = active
+            worker.return_value.isRunning.return_value = False
+            clock.return_value = 100
+            tab._request_git_refresh()
+            for tick in range(103, 130, 3):
+                clock.return_value = tick
+                tab._poll_status_if_visible()
+            assert worker.call_count == 1 and services.call_count == 9
+            clock.return_value = 130
+            tab._poll_status_if_visible()
+            assert worker.call_count == 2
+            clock.return_value = 161
+            state.return_value = Qt.ApplicationState.ApplicationInactive
+            tab._poll_status_if_visible()
+            assert worker.call_count == 2 and services.call_count == 11
+            state.return_value = active
+            visible.return_value = False
+            tab._poll_status_if_visible()
+            assert worker.call_count == 2
+            visible.return_value = True
+            tab._on_application_state_changed(active)
+            assert worker.call_count == 3
+            assert tab._git_file_timer.interval() == 1500
+            for _ in range(3):
+                tab.indexer._on_fs_change(str(root / "edited.txt"), None)
+            app.processEvents()
+            assert worker.call_count == 3 and tab._git_file_timer.isActive()
+            tab._git_file_timer.timeout.emit()
+            assert worker.call_count == 4 and not tab._git_file_timer.isActive()
+        tab._git_status_worker = None
+        tab.request_close(confirm_running=False, stop_running=False, quiet=True)
+        tab.deleteLater()
+        app.processEvents()
+    print("[OK]   Git refresh is debounced and foreground fallback is throttled", flush=True)
+    return []
+
+
 def launch_and_operation_guard_check() -> list[str]:
     """验证旧启动日志隔离、代次切换以及项目级编译/启停互斥。"""
     from types import SimpleNamespace
@@ -2980,6 +3255,497 @@ _HEX_RE = re.compile(r"#[0-9a-fA-F]{6}\b")
 _COMMENT_RE = re.compile(r"^\s*#")
 
 
+def cockpit_and_icons_check() -> None:
+    from threading import Thread
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QApplication
+
+    from src.core.service_state import KIND_MODULE, STATE_RUNNING_MANAGED, ServiceState
+    from src.core.usage_stats import UsageStats
+    from src.ui.cockpit_panel import ProjectCockpitPanel
+    from src.ui.icons import _SHAPES, icon
+    from src.ui.theme import THEME_GITHUB_DARK, THEME_GITHUB_LIGHT, apply_theme, current_theme
+
+    app = QApplication.instance() or QApplication([])
+    previous_theme = current_theme()
+    images = {}
+    try:
+        for theme in (THEME_GITHUB_DARK, THEME_GITHUB_LIGHT):
+            apply_theme(app, theme)
+            images[theme] = {}
+            for name in _SHAPES:
+                image = icon(name).pixmap(16, 16).toImage()
+                assert not image.isNull()
+                assert any(
+                    image.pixelColor(column, row).alpha()
+                    for row in range(image.height()) for column in range(image.width())
+                ), f"empty SVG: {name} ({theme})"
+                images[theme][name] = image
+        assert images[THEME_GITHUB_DARK]["play"] != images[THEME_GITHUB_LIGHT]["play"]
+        assert _SHAPES["refresh"] == '<path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/>'
+        assert images[THEME_GITHUB_DARK]["refresh"] != images[THEME_GITHUB_LIGHT]["refresh"]
+    finally:
+        apply_theme(app, previous_theme)
+    with tempfile.TemporaryDirectory() as tmp:
+        stats = UsageStats(Path(tmp) / "usage.json")
+        stats.record_cli("context", target="server", duration_ms=42)
+        meta = SimpleNamespace(
+            name="server", path=tmp, display_type="Spring Boot", profiles=[],
+            runtime_units=[SimpleNamespace(id="gateway", name="网关")], has_multiple_runtimes=True,
+        )
+        panel = ProjectCockpitPanel(meta, has_endpoints=True, stats=stats)
+        panel.update_services([ServiceState(
+            "server", "gateway", KIND_MODULE, STATE_RUNNING_MANAGED,
+            port=8181, expected_port=8080,
+        )])
+        row = panel._rows["gateway"]
+        assert row.port_label.text() == ":8181" and row.open_button.isEnabled()
+        row.copy_button.click()
+        assert app.clipboard().text() == "http://localhost:8181"
+        previous_event = panel.event_rows.itemAt(0).widget().labels[1]
+        assert previous_event.text() == "context"
+        producer = Thread(target=stats.record_cli, args=("health",), kwargs={
+            "target": "gateway", "ok": False, "error_code": "health_timeout", "duration_ms": 2300,
+        })
+        producer.start()
+        producer.join()
+        assert previous_event.text() == "context"
+        app.processEvents()
+        event_row = panel.event_rows.itemAt(0).widget()
+        assert event_row.labels[1].text() == "health"
+        assert event_row.labels[3].text() == "2.3s"
+        assert "health_timeout" in event_row.labels[4].text()
+        assert not event_row.property("clickable")
+        assert len(stats._listeners) == 1
+        panel.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        assert not stats._listeners
+        stats.flush()
+    print("[OK]   themed SVG pixels, cockpit ports, cross-thread AI events and disposal", flush=True)
+
+
+def cross_repo_picker_check() -> None:
+    import time
+    from unittest.mock import patch
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    from src.core.aggregate_workspace import AggregateProject
+    from src.core.config import AppConfig
+    from src.core.usage_stats import usage_stats
+    from src.ui.aggregate_project_tab import AggregateProjectTab
+    from src.ui.content_search import ContentSearchDialog
+    from src.ui.quick_open import PickerDialog
+
+    app = QApplication.instance() or QApplication([])
+
+    def wait_for(ready):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            app.processEvents()
+            if ready():
+                return
+            time.sleep(0.01)
+        raise AssertionError("async aggregate picker timed out")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for component in ("alpha", "beta"):
+            source = root / component / "src"
+            source.mkdir(parents=True)
+            (source.parent / "pom.xml").write_text("<project/>", encoding="utf-8")
+            class_name = component.title() + "Controller"
+            (source / f"{class_name}.java").write_text(
+                f'@RestController\npublic class {class_name} {{\n'
+                f'    @GetMapping("/{component}-summary")\n    public String summary() {{ return ""; }}\n}}\n',
+                encoding="utf-8",
+            )
+        project = AggregateProject.from_dict(root, {
+            "schemaVersion": 1, "id": "test", "name": "test", "kind": "aggregate",
+            "components": [
+                {"id": "alpha", "path": "alpha", "type": "java"},
+                {"id": "beta", "path": "beta", "name": "Beta UI", "type": "java",
+                 "runtime": {"units": [
+                     {"id": unit, "name": name, "cwd": ".", "start": ["echo", unit]}
+                     for unit, name in (("sync", "Worker Sync"), ("metrics", "Metrics"))
+                 ]}},
+            ],
+        })
+        tab = AggregateProjectTab(project, AppConfig())
+        try:
+            wait_for(lambda: len(tab.component_tabs) == 2
+                     and all(child.indexer.is_ready() for child in tab.component_tabs.values()))
+            alpha, beta = (tab.component_tabs[name] for name in ("alpha", "beta"))
+            assert alpha.center_tabs.widget(0) is alpha.log
+            alpha.center_tabs.setTabVisible(0, False)
+            assert alpha.center_stack.currentWidget() is alpha.cockpit
+            alpha.btn_overview.click()
+            assert alpha.center_tabs.isTabVisible(0)
+            assert alpha.center_stack.currentWidget() is alpha.center_tabs
+            alpha.center_tabs.setTabVisible(0, False)
+            index = alpha.center_tabs.addTab(QWidget(), "temporary")
+            assert alpha.center_stack.currentWidget() is alpha.center_tabs
+            alpha.center_tabs.setTabVisible(0, True)
+            alpha.center_tabs.tabBar().moveTab(index, 0)
+            assert alpha.center_tabs.widget(0) is alpha.log
+            alpha.center_tabs.removeTab(1)
+            alpha.center_tabs.setTabVisible(0, False)
+            assert alpha.center_stack.currentWidget() is alpha.cockpit
+            alpha._reveal_log_tab()
+            assert alpha.center_stack.currentWidget() is alpha.center_tabs
+            alpha.btn_overview.click()
+            assert alpha.center_stack.currentWidget() is alpha.cockpit
+            assert not any(node.text(1) for node in tab._project_nodes.values())
+            for command, target in (("start", "wOrKeR sYnC"), ("log", "BETA UI"), ("list-projects", "")):
+                usage_stats.record_cli(command, target=target)
+            app.processEvents()
+            event_rows = [alpha.cockpit.event_rows.itemAt(index).widget() for index in range(3)]
+            assert not event_rows[0].property("clickable")
+            assert event_rows[1].toolTip() == "点击查看 BETA UI 日志"
+            assert event_rows[2].cursor().shape() == Qt.CursorShape.PointingHandCursor
+            assert all(len(row.labels) == 5 for row in event_rows)
+            tab.select_component("alpha")
+            QTest.mouseClick(event_rows[0], Qt.MouseButton.LeftButton)
+            assert tab._current_project_tab() is alpha
+            QTest.mouseClick(event_rows[1], Qt.MouseButton.LeftButton)
+            assert tab._current_project_tab() is beta and beta.center_tabs.currentWidget() is beta.log
+            tab.select_component("alpha")
+            QTest.mouseClick(event_rows[2], Qt.MouseButton.LeftButton)
+            assert tab._current_project_tab() is beta
+            assert beta.center_tabs.currentWidget() is beta.module_logs["sync"]
+            usage_stats.record_cli("log", target="ALPHA")
+            app.processEvents()
+            QTest.mouseClick(beta.cockpit.event_rows.itemAt(0).widget(), Qt.MouseButton.LeftButton)
+            assert tab._current_project_tab() is alpha and alpha.center_tabs.currentWidget() is alpha.log
+            shown = []
+
+            def choose(query, subtitle):
+                dialog = shown[-1]
+                dialog.input.setText(query)
+
+                def has_result():
+                    item = dialog.list.item(0)
+                    result = item.data(Qt.ItemDataRole.UserRole) if item else None
+                    return result is not None and result.subtitle == subtitle
+
+                wait_for(has_result)
+                dialog._on_activated(dialog.list.item(0))
+
+            before = usage_stats.snapshot()["counters"]["gui"]
+            with patch.object(PickerDialog, "show", lambda dialog: shown.append(dialog)):
+                tab.select_component("alpha")
+                tab.open_file_picker()
+                choose("BetaController.java", "[beta] src/BetaController.java")
+                assert tab._current_project_tab() is beta
+                assert beta.center_tabs.currentWidget().get_path().endswith("BetaController.java")
+                assert all(child._controller_indexer is None for child in (alpha, beta))
+                tab.open_endpoint_picker()
+                choose("/alpha-summary", "[alpha] AlphaController.summary()")
+                assert tab._current_project_tab() is alpha
+                pane = alpha.center_tabs.currentWidget()
+                assert pane.get_path().endswith("AlphaController.java")
+                assert pane.view.textCursor().blockNumber() == 2
+            with patch.object(ContentSearchDialog, "show", lambda dialog: shown.append(dialog)):
+                alpha.cockpit.content_search_requested.emit()
+                dialog = shown[-1]
+                assert "跨仓全文搜索" in dialog.windowTitle()
+                dialog.input.setText('@GetMapping("/beta-summary")')
+                wait_for(lambda: dialog.tree.topLevelItemCount() == 1)
+                item = dialog.tree.topLevelItem(0)
+                assert item.text(1).startswith("[beta] src/BetaController.java")
+                dialog.tree.itemActivated.emit(item.child(0), 0)
+                assert tab._current_project_tab() is beta
+                cursor = beta.center_tabs.currentWidget().view.textCursor()
+                assert cursor.blockNumber() == 2 and cursor.positionInBlock() == 4
+                dialog.close()
+            after = usage_stats.snapshot()["counters"]["gui"]
+            for action in ("shortcut:quick_open", "shortcut:endpoint_picker", "shortcut:content_search"):
+                assert after[action]["count"] == before.get(action, {}).get("count", 0) + 1
+        finally:
+            tab.request_close(confirm_running=False, stop_running=False, quiet=True)
+            tab.deleteLater()
+            app.processEvents()
+    print("[OK]   cockpit activity clicks and aggregate file/content/endpoint routing", flush=True)
+
+
+def ripgrep_search_check() -> None:
+    from io import BytesIO
+    import json
+    import shutil
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    from src.ui import content_search
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        files = {
+            "code.TXT": "前缀 target\nTARGET again\nretarget\n",
+            "trace.log": "target\n",
+            "other.md": "target\n",
+            "excluded/skip.txt": "target\n",
+            "large.txt": "target\n" + "0" * content_search.MAX_FILE_SIZE,
+        }
+        for name, text in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+
+        def search(*, noise=False, ext=(".txt",), case=False, regex=False, query="target", cached=False):
+            worker = content_search.SearchWorker(
+                str(root), query, case, True, regex, list(ext),
+                file_list=[str(root / name) for name in files] if cached else None, include_noise=noise,
+            )
+            worker.excluded_roots = (root / "excluded",)
+            matches, done = [], []
+            worker.match_found.connect(matches.extend)
+            worker.done.connect(lambda scanned, total: done.append(total))
+            worker.run()
+            assert done == [len(matches)]
+            return {(hit.rel_path, hit.line_no, hit.col_start) for hit in matches}
+
+        match = {
+            "type": "match",
+            "data": {"path": {"text": "code.TXT"}, "lines": {"text": "前缀 target\r\n"}, "line_number": 1},
+        }
+        summary = {"type": "summary", "data": {"stats": {"searches": 1}}}
+
+        def process(messages, code):
+            return SimpleNamespace(
+                stdout=BytesIO(b"".join(json.dumps(item).encode() + b"\n" for item in messages)),
+                wait=lambda: code, poll=lambda: code,
+            )
+
+        expected = {("code.TXT", 1, 3), ("code.TXT", 2, 0)}
+        with patch.object(content_search.shutil, "which", return_value=None):
+            assert search(cached=True) == expected
+        with patch.object(content_search.shutil, "which", return_value="rg"):
+            with patch.object(content_search.subprocess, "Popen", return_value=process([match, summary], 0)) as spawn:
+                assert search() == {("code.TXT", 1, 3)}
+                assert "--json" in spawn.call_args.args[0] and "--max-filesize" in spawn.call_args.args[0]
+            with patch.object(content_search.subprocess, "Popen", return_value=process([match], 2)):
+                assert search() == expected
+            with patch.object(content_search.subprocess, "Popen", side_effect=OSError):
+                assert search(cached=True) == expected
+            stopped = content_search.SearchWorker(str(root), "target", False, False, False, [])
+            proc = Mock()
+            proc.poll.return_value = None
+            stopped._process = proc
+            stopped.stop()
+            proc.kill.assert_called_once()
+        if shutil.which("rg"):
+            with patch.object(content_search.SearchWorker, "_run_walk", side_effect=AssertionError("rg fallback")):
+                assert search() == expected
+                assert search(case=True, regex=True, query="^TARGET") == {("code.TXT", 2, 0)}
+                assert search(noise=True, ext=()) == expected | {
+                    ("trace.log", 1, 0), ("other.md", 1, 0),
+                }
+                with patch.object(content_search, "MAX_MATCHES", 1):
+                    assert len(search()) == 1
+        second = root.parent / f"{root.name}-secondary"
+        with tempfile.TemporaryDirectory(prefix=second.name) as secondary:
+            second = Path(secondary)
+            (second / "code.TXT").write_text("前缀 target\nTARGET again\n", encoding="utf-8")
+            roots = [("first", str(root)), ("second", str(second))]
+
+            def multi_search(*, stop_on_second=False):
+                worker = content_search.SearchWorker(
+                    roots=roots, query="target", whole_word=True, include_exts=[".txt"],
+                )
+                matches, done, stopped = [], [], []
+
+                def collect(batch):
+                    matches.extend(batch)
+                    if stop_on_second and batch[0].component == "second":
+                        worker.stop()
+
+                worker.match_found.connect(collect)
+                worker.done.connect(lambda scanned, total: done.append(total))
+                worker.stopped.connect(lambda: stopped.append(True))
+                worker.run()
+                assert (stopped, done) == (([True], []) if stop_on_second else ([], [3]))
+                return [(hit.component, hit.rel_path, hit.line_no, hit.col_start) for hit in matches]
+
+            second_line = {
+                "type": "match", "data": {**match["data"], "lines": {"text": "TARGET again\n"}, "line_number": 2},
+            }
+            expected = [("first", "code.TXT", 1, 3), ("first", "code.TXT", 2, 0),
+                        ("second", "code.TXT", 1, 3)]
+            with patch.object(content_search, "MAX_MATCHES", 3):
+                with patch.object(content_search.shutil, "which", return_value="rg"):
+                    with patch.object(content_search.subprocess, "Popen", side_effect=[
+                        process([match, second_line, summary], 0), process([match, second_line, summary], 0),
+                    ]):
+                        assert multi_search() == expected
+                    with patch.object(content_search.subprocess, "Popen", side_effect=[
+                        process([match, second_line, summary], 0), process([match], 2),
+                    ]):
+                        assert multi_search() == expected
+                with patch.object(content_search.shutil, "which", return_value=None), \
+                        patch.object(content_search, "scan_exclusion_roots", return_value=(root / "excluded",)):
+                    assert multi_search() == expected
+                    assert multi_search(stop_on_second=True) == expected
+                if shutil.which("rg"):
+                    with patch.object(content_search, "scan_exclusion_roots", return_value=(root / "excluded",)), \
+                            patch.object(content_search.SearchWorker, "_run_walk", side_effect=AssertionError("rg fallback")):
+                        assert multi_search() == expected
+    print("[OK]   single/multi-root ripgrep JSON, Python fallback, cancellation and shared cap", flush=True)
+
+
+def snapshot_ipc_check() -> None:
+    import json
+    import subprocess
+    import time
+    import uuid
+    from unittest.mock import patch
+
+    from PySide6.QtCore import QThread
+    from PySide6.QtWidgets import QApplication
+
+    import main as app_main
+    from src.core import cli_server, git_ops
+    from src.core.aggregate_workspace import (
+        AggregateProject, DevelopmentWorkspace, save_aggregate_project, save_development_workspace,
+    )
+    from src.core.cli_contract import capabilities, help_text
+    from src.core.config import AppConfig
+    from src.ui.main_window import MainWindow
+    from src.util.git_executable import resolve_git_executable
+
+    assert capabilities()["commands"]["snapshot"]["effect"] == "read"
+    assert "--max-chars" in help_text("snapshot")
+    app = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp).resolve()
+        suite = root / "suite"
+        api = suite / "api"
+        ui = suite / "web"
+        worktree = suite / "workspace" / "task" / "api"
+        for path in (api, ui, worktree):
+            path.mkdir(parents=True)
+        runtime = {"units": [
+            {"id": unit, "name": unit.title(), "cwd": ".", "start": ["echo", unit],
+             "expectedPort": port, "healthCheckPath": "/health"}
+            for unit, port in (("gateway", 8080), ("auth", 8081))
+        ]}
+        aggregate = AggregateProject.from_dict(suite, {
+            "schemaVersion": 1, "id": "suite", "name": "Snapshot Suite", "kind": "aggregate",
+            "workspaceDirectory": "workspace",
+            "components": [
+                {"id": "api", "path": "api", "type": "generic", "runtime": runtime},
+                {"id": "web", "path": "web", "type": "generic", "shared": True},
+            ],
+        })
+        save_aggregate_project(aggregate)
+        workspace = DevelopmentWorkspace.from_dict(worktree.parent, {
+            "schemaVersion": 1, "id": "task", "name": "Snapshot Task",
+            "createdAt": "2026-09-03T00:00:00Z", "aggregateProjectPath": str(suite),
+            "status": "active", "components": [
+                {"id": "api", "sourceRepositoryPath": str(api), "mode": "worktree",
+                 "worktreePath": str(worktree), "baseBranch": "develop", "baseCommit": "abc",
+                 "taskBranch": "feature/task-api"},
+                {"id": "web", "sourceRepositoryPath": str(ui), "mode": "shared"},
+            ],
+        }, aggregate_project=aggregate)
+        save_development_workspace(workspace, aggregate_project=aggregate)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for args in (("init", "-b", "develop"),
+                     ("-c", "user.name=Smoke", "-c", "user.email=smoke@example.invalid",
+                      "commit", "--allow-empty", "-m", "seed")):
+            subprocess.run([resolve_git_executable(), *args], cwd=api, check=True,
+                           capture_output=True, creationflags=flags)
+        for index in range(12):
+            (api / f"modified-{index:02}.txt").touch()
+        server_name = "mini-ide-snapshot-smoke-" + uuid.uuid4().hex
+        env = {**os.environ, "MINI_IDE_SERVER_NAME": server_name}
+        window = MainWindow(AppConfig(aggregate_project_paths=[str(suite)]))
+        with patch.object(app_main, "SERVER_NAME", server_name):
+            server = app_main._start_local_server(window)
+        assert server is not None
+
+        def wait_for(ready):
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                app.processEvents()
+                if ready():
+                    return
+                time.sleep(0.01)
+            raise AssertionError("isolated snapshot IPC timed out")
+
+        def cli(*arguments):
+            result = subprocess.Popen(
+                [sys.executable, "-X", "utf8", str(Path(app_main.__file__).with_name("cli_main.py")),
+                 "--snapshot", *arguments, "--machine"],
+                env=env, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags,
+            )
+            try:
+                wait_for(lambda: result.poll() is not None)
+            finally:
+                if result.poll() is None:
+                    result.kill()
+            stdout, stderr = result.communicate()
+            assert result.returncode == 0, (stdout, stderr)
+            machine = json.loads(stdout)
+            assert machine["ok"] and machine["command"] == "snapshot"
+            return machine["data"]
+
+        git_threads = []
+        list_changed_files = git_ops.list_changed_files
+
+        def tracked_git(*args, **kwargs):
+            git_threads.append(QThread.currentThread())
+            return list_changed_files(*args, **kwargs)
+
+        environment = None
+        try:
+            before = window.tabs.count()
+            with patch.object(git_ops, "list_changed_files", side_effect=tracked_git):
+                snapshot = cli("Snapshot Suite")
+            assert git_threads and all(thread != app.thread() for thread in git_threads)
+            assert window.tabs.count() == before and snapshot["target"]["kind"] == "aggregate"
+            assert snapshot["target"]["aggregate_name"] == "Snapshot Suite"
+            projects = snapshot["projects"]
+            assert [item["id"] for item in projects] == ["api", "web"]
+            assert not projects[0]["observed"] and projects[0]["runtimes"][0]["state"] == "unknown"
+            assert projects[0]["git"]["branch"] == "develop" and projects[0]["git"]["changed_count"] == 12
+            assert len(projects[0]["git"]["changed_files"]) == 10
+            snapshot = cli("Snapshot Task")
+            assert snapshot["target"]["kind"] == "workspace"
+            assert snapshot["target"]["workspace_name"] == "Snapshot Task"
+            assert snapshot["projects"][0]["path"] == str(worktree)
+            environment = window.open_aggregate_project(str(suite), quiet=True)
+            wait_for(lambda: len(environment.component_tabs) == 2)
+            controller = environment.component_tabs["api"].service_controller
+            controller.begin_launch("gateway")
+            controller.record_service_output("gateway", "Error from previous launch")
+            generation = controller.begin_launch("gateway")
+            controller.begin_launch("auth")
+            for line in ("Earlier error in same run", "ready", "Latest error", "    gateway " + "x" * 110):
+                controller.record_service_output("gateway", line)
+            controller.record_service_output("auth", "Error in auth")
+            snapshot = cli("api", "--tail", "1", "--max-chars", "100")
+            assert snapshot["target"]["kind"] == "aggregate_component"
+            project, = snapshot["projects"]
+            assert project["observed"] and project["runtimes"][0]["health_url"] == "http://127.0.0.1:8080/health"
+            gateway, auth = project["errors"]
+            assert gateway["generation"] == generation and gateway["lines"][0] == "Latest error"
+            assert len("\n".join(gateway["lines"])) == 100 and gateway["truncated"]
+            assert auth["lines"] == [] and auth["truncated"] and snapshot["truncated"]
+            assert len(snapshot["recent_ai_events"]) <= 5
+            assert (cli(str(root))["target"]["kind"]) == "normal_project"
+        finally:
+            server.close()
+            if environment is not None:
+                environment.request_close(confirm_running=False, stop_running=False, quiet=True)
+            window.deleteLater()
+            app.processEvents()
+    print("[OK]   snapshot parsing, isolated IPC, target scopes, background Git and current-run budget", flush=True)
+
+
 def hex_scan() -> list[tuple[str, int, str]]:
     """扫描 src/ 下所有 .py，返回 [(rel_path, lineno, line)] 表示违规命中"""
     hits: list[tuple[str, int, str]] = []
@@ -3000,7 +3766,7 @@ def hex_scan() -> list[tuple[str, int, str]]:
     return hits
 
 
-if __name__ == "__main__":
+def main() -> int:
     failed = import_check()
     theme_failed = theme_switch_check()
     model_failed = service_state_check()
@@ -3018,6 +3784,10 @@ if __name__ == "__main__":
     cli_reliability_failed = cli_response_and_packaging_check()
     file_failed = file_action_check()
     preview_failed = file_preview_model_check()
+    usage_stats_failed = usage_stats_check()
+    preview_edit_failed = file_preview_edit_mode_check()
+    log_retention_failed = log_retention_check()
+    git_refresh_failed = project_git_refresh_check()
     aggregate_scan_failed = aggregate_scan_isolation_check()
     git_failed = git_context_check()
     nginx_failed = nginx_detector_check()
@@ -3029,6 +3799,10 @@ if __name__ == "__main__":
     aggregate_definition_failed = aggregate_definition_management_check()
     workspace_session_failed = workspace_tab_session_check()
     target_resolution_failed = target_resolution_check()
+    cockpit_and_icons_check()
+    cross_repo_picker_check()
+    ripgrep_search_check()
+    snapshot_ipc_check()
 
     print()
     print("Hex hardcode scan (CLAUDE.md hard rule 15):")
@@ -3053,6 +3827,8 @@ if __name__ == "__main__":
         + len(compile_wait_failed) + len(workspace_cli_thread_failed)
         + len(cli_reliability_failed)
         + len(file_failed) + len(preview_failed)
+        + len(usage_stats_failed) + len(preview_edit_failed)
+        + len(log_retention_failed) + len(git_refresh_failed)
         + len(aggregate_scan_failed)
         + len(git_failed) + len(nginx_failed)
         + len(aggregate_failed) + len(development_lifecycle_failed)
@@ -3064,4 +3840,17 @@ if __name__ == "__main__":
     print()
     print(f"Result: imports {len(modules) - len(failed)}/{len(modules)}, "
           f"hex hits {len(hex_hits)}", flush=True)
-    sys.exit(1 if total_fail else 0)
+    return 1 if total_fail else 0
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory(prefix="mini-ide-smoke-") as smoke_config:
+        os.environ["APPDATA"] = smoke_config
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        try:
+            exit_code = main()
+        finally:
+            if "src.core.usage_stats" in sys.modules:
+                sys.modules["src.core.usage_stats"].usage_stats.flush()
+            logging.shutdown()
+    sys.exit(exit_code)

@@ -36,6 +36,7 @@ from src.core.service_state import (
 )
 from src.core.search_worker_lifecycle import BackgroundShutdownWaiter, active_background_workers
 from src.core.application_lifecycle import ApplicationQuitGuard
+from src.core.usage_stats import usage_stats
 from src.ui.empty_state import EmptyState
 from src.ui.aggregate_project_tab import AggregateProjectTab
 from src.ui.project_tab import ProjectTab
@@ -132,6 +133,11 @@ class _CreateAggregateProjectWorker(BackgroundThread):
             self.done.emit(None, str(exc))
 
 
+class _UsageStatsFlushWorker(BackgroundThread):
+    def run(self) -> None:
+        self.saved = usage_stats.flush()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig):
         super().__init__()
@@ -204,25 +210,26 @@ class MainWindow(QMainWindow):
         - 若每个 tab 各自注册窗口级快捷键，多 tab 时同窗口内同一序列重复，
           Qt 会判定歧义导致全部失效；集中注册一份就没有这个问题
         """
-        # (序列, 调用当前 tab 的哪个方法名)
         bindings = [
-            ("Ctrl+Shift+N", "open_file_picker"),
-            ("Ctrl+Shift+F", "open_content_search"),
-            ("Ctrl+E", "open_recent_files"),
-            ("Ctrl+\\", "open_endpoint_picker"),
-            ("Ctrl+Shift+R", "restart_project"),
-            ("Ctrl+W", "close_current_file_tab"),
+            ("Ctrl+Shift+N", "open_file_picker", None),
+            ("Ctrl+Shift+F", "open_content_search", None),
+            ("Ctrl+E", "open_recent_files", None),
+            ("Ctrl+\\", "open_endpoint_picker", None),
+            ("Ctrl+Shift+R", "restart_project", None),
+            ("Ctrl+W", "close_current_file_tab", None),
         ]
-        for seq, method in bindings:
+        for seq, method, action in bindings:
             sc = QShortcut(QKeySequence(seq), self)
-            sc.activated.connect(lambda m=method: self._dispatch_to_current_tab(m))
+            sc.activated.connect(lambda m=method, a=action: self._dispatch_to_current_tab(m, a))
 
-    def _dispatch_to_current_tab(self, method_name: str) -> None:
+    def _dispatch_to_current_tab(self, method_name: str, action: str | None = None) -> None:
         """把快捷键动作转发给当前可见的项目 tab。没有打开项目时静默忽略。"""
         tab = self.tabs.currentWidget()
         if isinstance(tab, (ProjectTab, AggregateProjectTab)):
             fn = getattr(tab, method_name, None)
             if callable(fn):
+                if action:
+                    usage_stats.record_gui(action)
                 fn()
 
     def _build_menu(self) -> None:
@@ -268,6 +275,9 @@ class MainWindow(QMainWindow):
         open_log_dir_act = QAction("打开日志目录", self)
         open_log_dir_act.triggered.connect(self._open_log_dir)
         help_menu.addAction(open_log_dir_act)
+        open_usage_act = QAction("打开用量统计", self)
+        open_usage_act.triggered.connect(self._open_usage_stats)
+        help_menu.addAction(open_usage_act)
         help_menu.addSeparator()
         about = QAction("关于", self)
         about.triggered.connect(self._about)
@@ -464,7 +474,10 @@ class MainWindow(QMainWindow):
                     self._shutdown_waiter.start()
                 return
             self._quit_requested = True
-            self.close()
+            worker = _UsageStatsFlushWorker(self)
+            worker.finished.connect(self.close)
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
 
     def _rebuild_recent_menu(self) -> None:
         self.recent_menu.clear()
@@ -843,6 +856,23 @@ class MainWindow(QMainWindow):
     def _open_log_dir(self) -> None:
         from src.core.config import LOG_DIR
         open_folder(str(LOG_DIR))
+
+    def _open_usage_stats(self) -> None:
+        worker = _UsageStatsFlushWorker(self)
+        worker.finished.connect(self._open_flushed_usage_stats)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _open_flushed_usage_stats(self) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        if self._shutdown_in_progress:
+            return
+        worker = self.sender()
+        if worker.saved and QDesktopServices.openUrl(QUrl.fromLocalFile(str(usage_stats.path))):
+            return
+        QMessageBox.information(self, "用量统计", "无法打开用量统计文件。")
 
     def _restore_geometry(self) -> None:
         g = self.config.window_geometry

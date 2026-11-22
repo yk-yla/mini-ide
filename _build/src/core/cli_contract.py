@@ -19,6 +19,8 @@ COMMANDS = {
     "capabilities": _command("Describe commands, arguments and side effects", offline=True),
     "version": _command("Show this CLI package version", offline=True),
     "status": _command("Snapshot open projects and services"),
+    "snapshot": _command("Capture recent run errors, runtime state and Git status", ("target",), ("tail", "max-chars")),
+    "usage-stats": _command("Read local usage counters and recent CLI activity"),
     "list-projects": _command("List open projects"),
     "list-aggregates": _command("List registered aggregates"),
     "list-workspaces": _command("List registered development workspaces"),
@@ -137,6 +139,9 @@ def parse_command(args: list[str]) -> dict:
             parsed["current_run"] = True
         if parsed.get("all_modules") and parsed.get("module"):
             raise ArgumentError("--all-modules cannot be combined with one module")
+    if name == "snapshot":
+        parsed.setdefault("tail", 60)
+        parsed.setdefault("max_chars", 12000)
     return {"cmd": "preflight-build" if name == "can-quit" else name, **parsed}
 
 

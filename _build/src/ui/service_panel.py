@@ -18,13 +18,14 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QStyle, QToolButton,
+    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QToolButton,
     QVBoxLayout, QWidget,
 )
 
+from src.ui.icons import icon
 from src.ui.theme import (
-    ACCENT, BG_L0, BG_L1, BG_L4, BORDER_SUBTLE, COLOR_SUCCESS, COLOR_WARN,
-    FG_DIM, FG_PRIMARY, FG_SECONDARY, FONT_PT_UI, FONT_PT_UI_SM,
+    ACCENT, BG_L4, BORDER_SUBTLE, COLOR_SUCCESS, COLOR_WARN,
+    FG_DIM, FG_ON_ACCENT, FG_PRIMARY, FG_SECONDARY, FONT_PT_UI, FONT_PT_UI_SM, H_BTN_SM,
 )
 
 
@@ -61,10 +62,7 @@ class _ServiceRow(QFrame):
         self._state = STATE_IDLE
 
         self.setObjectName("service_row")
-        self.setStyleSheet(
-            f"#service_row {{ background:transparent; border:none; }}"
-            f"#service_row:hover {{ background:{BG_L4}; }}"
-        )
+        self._display = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         lay = QHBoxLayout(self)
@@ -81,8 +79,8 @@ class _ServiceRow(QFrame):
         self.lbl_info.setStyleSheet(f"color:{FG_SECONDARY}; font-size:{FONT_PT_UI_SM}pt;")
         lay.addWidget(self.lbl_info)
 
-        self.btn = QPushButton("▶")
-        self.btn.setFixedSize(22, 22)
+        self.btn = QPushButton()
+        self.btn.setFixedSize(H_BTN_SM, H_BTN_SM)
         self.btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn.clicked.connect(self._on_btn)
@@ -107,6 +105,10 @@ class _ServiceRow(QFrame):
         pid: int | None = None, reason: str = "", ports: list[int] | None = None,
     ):
         self._state = state
+        display = (state, port, pid, reason, tuple(ports or ()))
+        if display == self._display:
+            return
+        self._display = display
         # port 优先用本次传入的（启动后从日志抓的真实端口），否则用 application.yml 的默认值
         effective_port = port if port is not None else self.default_port
         if ports:
@@ -117,21 +119,21 @@ class _ServiceRow(QFrame):
         if state == STATE_IDLE:
             self.lbl_info.setText(port_str)
             self.lbl_info.setStyleSheet(f"color:{FG_SECONDARY}; font-size:{FONT_PT_UI_SM}pt;")
-            self.btn.setText("▶")
+            self.btn.setIcon(icon("play", FG_SECONDARY))
             self.btn.setToolTip(f"启动 {self.display_name}")
             self.btn.setEnabled(True)
             self.btn.setStyleSheet(_row_btn_qss(BORDER_SUBTLE, FG_DIM))
         elif state == STATE_STARTING:
             self.lbl_info.setText(f"启动中 {port_str}".strip())
             self.lbl_info.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI_SM}pt;")
-            self.btn.setText("◐")
+            self.btn.setIcon(icon("activity", COLOR_WARN))
             self.btn.setToolTip(f"{self.display_name} 正在启动")
             self.btn.setEnabled(False)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_WARN, COLOR_WARN))
         elif state == STATE_RUNNING:
             self.lbl_info.setText(f"运行 {port_str}".strip())
             self.lbl_info.setStyleSheet(f"color:{COLOR_SUCCESS}; font-size:{FONT_PT_UI_SM}pt;")
-            self.btn.setText("⏹")
+            self.btn.setIcon(icon("stop", COLOR_SUCCESS))
             tip = f"{self.display_name} 由当前 mini-ide 启动，日志上下文完整。"
             if effective_port:
                 tip += f"\n端口：{effective_port}"
@@ -141,7 +143,7 @@ class _ServiceRow(QFrame):
         elif state == STATE_RUNNING_EXTERNAL:
             self.lbl_info.setText(f"外部 {port_str}".strip())
             self.lbl_info.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI_SM}pt;")
-            self.btn.setText("⏹")
+            self.btn.setIcon(icon("stop", COLOR_WARN))
             tip = f"{self.display_name} 正在 mini-ide 之外运行，当前 IDE 没有启动日志上下文。"
             if ports:
                 tip += f"\n端口：{', '.join(str(p) for p in ports)}"
@@ -157,10 +159,17 @@ class _ServiceRow(QFrame):
         elif state == STATE_STOPPING:
             self.lbl_info.setText(f"停止中 {port_str}".strip())
             self.lbl_info.setStyleSheet(f"color:{COLOR_WARN}; font-size:{FONT_PT_UI_SM}pt;")
-            self.btn.setText("◐")
+            self.btn.setIcon(icon("activity", COLOR_WARN))
             self.btn.setToolTip(f"{self.display_name} 正在停止")
             self.btn.setEnabled(False)
             self.btn.setStyleSheet(_row_btn_qss(COLOR_WARN, COLOR_WARN))
+        self.btn.setAccessibleName(self.btn.toolTip())
+
+    def _refresh_theme(self) -> None:
+        self.lbl_name.setStyleSheet(f"color:{FG_PRIMARY}; font-size:{FONT_PT_UI}pt;")
+        state, port, pid, reason, ports = self._display
+        self._display = None
+        self.set_state(state, port, pid=pid, reason=reason, ports=ports)
 
     def current_state(self) -> str:
         return self._state
@@ -181,29 +190,25 @@ class ServicePanel(QWidget):
     ):
         """modules: [(id, port)] 或 [(id, display_name, port)]。"""
         super().__init__(parent)
-        self.setStyleSheet(f"QWidget {{ background:{BG_L1}; }}")
+        self.setObjectName("service_panel")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
         header = QFrame()
-        header.setStyleSheet(
-            f"background:{BG_L0}; border-bottom:1px solid {BORDER_SUBTLE};"
-        )
+        header.setObjectName("service_header")
         h_lay = QHBoxLayout(header)
         h_lay.setContentsMargins(10, 6, 6, 6)
         h_lay.setSpacing(6)
 
-        title_label = QLabel(f"🧩  {title} ({len(modules)})")
-        title_label.setStyleSheet(f"color:{FG_PRIMARY}; font-size:{FONT_PT_UI}pt;")
+        self.title_icon = QLabel()
+        h_lay.addWidget(self.title_icon)
+        title_label = QLabel(f"{title} ({len(modules)})")
         h_lay.addWidget(title_label)
         h_lay.addStretch(1)
 
         self.btn_clear_logs = QToolButton()
-        self.btn_clear_logs.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton)
-        )
         self.btn_clear_logs.setAccessibleName("清空日志")
         self.btn_clear_logs.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_clear_logs.setToolTip("清空当前项目所有服务控制台日志")
@@ -212,7 +217,6 @@ class ServicePanel(QWidget):
 
         self.btn_start_all = QToolButton()
         self.btn_start_all.setProperty("role", "primary")
-        self.btn_start_all.setText("▶")
         self.btn_start_all.setAccessibleName("全部启动")
         self.btn_start_all.setToolTip("全部启动")
         self.btn_start_all.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -221,7 +225,6 @@ class ServicePanel(QWidget):
 
         self.btn_stop_all = QToolButton()
         self.btn_stop_all.setProperty("role", "danger")
-        self.btn_stop_all.setText("■")
         self.btn_stop_all.setAccessibleName("全部停止")
         self.btn_stop_all.setToolTip("全部停止")
         self.btn_stop_all.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -232,7 +235,6 @@ class ServicePanel(QWidget):
         root.addWidget(header)
 
         rows_wrap = QFrame()
-        rows_wrap.setStyleSheet(f"background:{BG_L1};")
         rlay = QVBoxLayout(rows_wrap)
         rlay.setContentsMargins(0, 0, 0, 0)
         rlay.setSpacing(0)
@@ -263,6 +265,15 @@ class ServicePanel(QWidget):
         )
         self.rows_scroll.setWidget(rows_wrap)
         root.addWidget(self.rows_scroll, 1)
+        self.refresh_theme()
+
+    def refresh_theme(self) -> None:
+        self.title_icon.setPixmap(icon("layers").pixmap(16, 16))
+        self.btn_clear_logs.setIcon(icon("clear"))
+        self.btn_start_all.setIcon(icon("play", FG_ON_ACCENT))
+        self.btn_stop_all.setIcon(icon("stop", COLOR_WARN))
+        for row in self._rows.values():
+            row._refresh_theme()
 
     def update_state(
         self, module: str, state: str,

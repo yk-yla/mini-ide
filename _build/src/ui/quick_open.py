@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import zip_longest
 from typing import Callable
 
 from PySide6.QtCore import Qt, QEvent, QSize, QTimer, Signal
@@ -20,8 +21,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from src.core.file_index import FileSearchWorker
-from src.core.search_worker_lifecycle import register_search_worker, background_tasks_suspended
+from src.core.controller_index import search_endpoints
+from src.core.file_index import FileSearchWorker, search_indexed_files
+from src.core.search_worker_lifecycle import (
+    BackgroundThread, register_search_worker, background_tasks_suspended,
+)
 from src.ui.theme import (
     ACCENT, ACCENT_SUBTLE, BG_CODE, BG_L1, BG_L2, BG_L4,
     BORDER_STRONG, BORDER_SUBTLE, FG_BRIGHT, FG_DIM, FG_PRIMARY, FG_SECONDARY,
@@ -112,6 +116,21 @@ class PickerItem:
     data: object = None             # 回调用的数据
 
 
+class _PickerSearchWorker(BackgroundThread):
+    result = Signal(int, list)
+
+    def __init__(self, fetch, query, generation, parent=None):
+        super().__init__(parent)
+        self.fetch = fetch
+        self.query = query
+        self.generation = generation
+
+    def run(self):
+        items = self.fetch(self.query, self.isInterruptionRequested)
+        if not self.isInterruptionRequested():
+            self.result.emit(self.generation, items)
+
+
 class PickerDialog(QDialog):
     """通用快速选择浮窗"""
 
@@ -164,8 +183,9 @@ class PickerDialog(QDialog):
         self._fetcher: Callable[[str], list[PickerItem]] | None = None
         self._all_items: list[PickerItem] = []
         self._async_indexer = None
+        self._async_fetcher = None
         self._search_generation = 0
-        self._search_workers: list[FileSearchWorker] = []
+        self._search_workers: list[BackgroundThread] = []
 
         # 输入去抖：大仓库下 fetcher 是全表 O(n) 模糊打分，每个按键都跑会卡顿。
         # textChanged 只重置定时器，停顿 120ms 后才真正刷新候选列表。
@@ -174,18 +194,30 @@ class PickerDialog(QDialog):
         self._debounce.setInterval(120)
         self._debounce.timeout.connect(self._do_refresh)
         self._pending_query = ""
+        self.finished.connect(self._stop_search)
 
     def set_fetcher(self, fetcher: Callable[[str], list[PickerItem]]) -> None:
         """fetcher(query) -> items；query 为空时返回默认列表"""
         self._async_indexer = None
+        self._async_fetcher = None
         self._fetcher = fetcher
         self._refresh("")
 
     def set_file_indexer(self, indexer) -> None:
         """文件名搜索使用后台 worker，空查询只展示已有索引切片。"""
         self._fetcher = None
+        self._async_fetcher = None
         self._async_indexer = indexer
         self._refresh("")
+
+    def set_async_fetcher(self, fetcher) -> None:
+        self._fetcher = self._async_indexer = None
+        self._async_fetcher = fetcher
+        self.refresh_candidates()
+
+    def refresh_candidates(self, _count=0) -> None:
+        self._debounce.stop()
+        self._refresh(self.input.text())
 
     def set_static_items(self, items: list[PickerItem]) -> None:
         self._all_items = items
@@ -200,7 +232,7 @@ class PickerDialog(QDialog):
     def _on_query_changed(self, text: str) -> None:
         # 走去抖：仅记录最新 query 并重启定时器，停顿后由 _do_refresh 真正刷新
         self._pending_query = text
-        if self._async_indexer is not None:
+        if self._async_indexer is not None or self._async_fetcher is not None:
             self._cancel_search_workers()
         self._debounce.start()
 
@@ -208,6 +240,9 @@ class PickerDialog(QDialog):
         self._refresh(self._pending_query)
 
     def _refresh(self, query: str) -> None:
+        if self._async_fetcher is not None:
+            self._start_async_refresh(query)
+            return
         if self._async_indexer is not None:
             if query.strip():
                 self._start_async_refresh(query)
@@ -244,13 +279,19 @@ class PickerDialog(QDialog):
         self._cancel_search_workers()
         self._search_generation += 1
         generation = self._search_generation
-        worker = FileSearchWorker(
-            self._async_indexer.files(), query, 150, generation,
-            parent=QApplication.instance(),
-        )
+        if self._async_fetcher is not None:
+            worker = _PickerSearchWorker(
+                self._async_fetcher, query, generation, parent=QApplication.instance(),
+            )
+            worker.result.connect(self._on_picker_result)
+        else:
+            worker = FileSearchWorker(
+                self._async_indexer.files(), query, 150, generation,
+                parent=QApplication.instance(),
+            )
+            worker.result.connect(self._on_async_result)
         self._search_workers.append(worker)
         register_search_worker(worker, worker.requestInterruption)
-        worker.result.connect(self._on_async_result)
         worker.finished.connect(self._on_search_worker_finished)
         worker.finished.connect(worker.deleteLater)
         self.list.clear()
@@ -276,6 +317,10 @@ class PickerDialog(QDialog):
             )
             for item in hits
         ])
+
+    def _on_picker_result(self, generation: int, items: list[PickerItem]) -> None:
+        if generation == self._search_generation:
+            self._set_items(items)
 
     def _on_search_worker_finished(self) -> None:
         worker = self.sender()
@@ -308,9 +353,12 @@ class PickerDialog(QDialog):
             return
         super().changeEvent(e)
 
-    def closeEvent(self, e):
+    def _stop_search(self):
         self._debounce.stop()
         self._cancel_search_workers()
+
+    def closeEvent(self, e):
+        self._stop_search()
         super().closeEvent(e)
 
     def eventFilter(self, obj, e):
@@ -346,6 +394,62 @@ def show_file_picker(indexer, on_pick: Callable[[str], None], parent=None) -> Pi
 
     dlg.set_file_indexer(indexer)
     dlg.picked.connect(on_pick)
+    return dlg
+
+
+def show_component_picker(sources, on_pick, *, endpoints=False, parent=None) -> PickerDialog:
+    single = len(sources) == 1 and not sources[0][0]
+    if endpoints:
+        title = "按接口地址定位   (Ctrl+\\)" if single else "跨仓接口搜索   (Ctrl+\\)"
+    else:
+        title = "跨仓文件搜索   (Ctrl+Shift+N)"
+    dlg = PickerDialog(title, parent)
+    dlg.input.setPlaceholderText("搜索接口地址或方法名" if endpoints else "搜索各项目文件名")
+
+    def fetch(query, should_stop):
+        by_component = []
+        owners = {}
+        entries = []
+        has_query = bool(query.strip())
+        for component_id, indexer in sources:
+            if should_stop():
+                return []
+            snapshot = indexer.endpoints() if endpoints else indexer.files()
+            if not has_query:
+                snapshot = snapshot[:150]
+            by_component.append(snapshot)
+            owners.update((id(item), component_id) for item in snapshot)
+            entries.extend(snapshot)
+        if has_query:
+            search = search_endpoints if endpoints else search_indexed_files
+            matches = search(entries, query, 150, should_stop)
+        else:
+            matches = []
+            for group in zip_longest(*by_component):
+                matches.extend(item for item in group if item is not None)
+                if len(matches) >= 150:
+                    break
+        items = []
+        for item in matches[:150]:
+            component = owners[id(item)]
+            prefix = f"[{component}] " if component else ""
+            if endpoints:
+                items.append(PickerItem(
+                    item.display, f"{prefix}{item.class_name}.{item.method_name}()",
+                    (component, item.abs_path, item.line_no),
+                ))
+            else:
+                items.append(PickerItem(
+                    item.name_original, f"{prefix}{item.rel_path}",
+                    (component, item.abs_path, 0),
+                ))
+        return items
+
+    dlg.set_async_fetcher(fetch)
+    dlg.picked.connect(on_pick)
+    for _, indexer in sources:
+        signal = indexer.ready if endpoints else indexer.indexed
+        signal.connect(dlg.refresh_candidates)
     return dlg
 
 

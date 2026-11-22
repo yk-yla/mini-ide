@@ -204,16 +204,25 @@ class ControllerIndexer(QObject):
 
     def search(self, query: str, limit: int = 100) -> list[Endpoint]:
         """按路径模糊匹配。query 里的 / 和大小写都忽略，按子序列+子串打分。"""
-        q = query.strip().lower()
-        if not q:
-            return self._endpoints[:limit]
-        scored: list[tuple[int, Endpoint]] = []
-        for ep in self._endpoints:
-            s = _ep_score(ep, q)
-            if s > 0:
-                scored.append((s, ep))
-        scored.sort(key=lambda p: (-p[0], p[1].path))
-        return [e for _, e in scored[:limit]]
+        return search_endpoints(self._endpoints, query, limit)
+
+    def endpoints(self) -> list[Endpoint]:
+        return self._endpoints[:]
+
+
+def search_endpoints(endpoints, query, limit, should_stop=None) -> list[Endpoint]:
+    q = query.strip().lower()
+    if not q:
+        return endpoints[:limit]
+    scored: list[tuple[int, Endpoint]] = []
+    for index, endpoint in enumerate(endpoints):
+        if index % 256 == 0 and should_stop and should_stop():
+            return []
+        score = _ep_score(endpoint, q)
+        if score > 0:
+            scored.append((score, endpoint))
+    scored.sort(key=lambda pair: (-pair[0], pair[1].path))
+    return [endpoint for _, endpoint in scored[:limit]]
 
 
 def _ep_score(ep: Endpoint, q: str) -> int:

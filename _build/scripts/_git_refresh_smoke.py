@@ -111,11 +111,9 @@ def run():
         wait_until(lambda: tab._git_viewer is None)
     print("[OK] external 12-file commit, popup synchronization, slow queries and stale results", flush=True)
 
-    # 弹窗关闭后仍由原有三秒轮询发现外部编辑；切回应用主动刷新，不等下一轮。
+    wait_until(lambda: tab.indexer._observer is not None)
     (root / "file-0.txt").write_text("polling\n", encoding="utf-8")
-    tab._poll_timer.start()
     wait_until(lambda: "1 处改动" in tab.btn_changes.text(), 4.5)
-    tab._poll_timer.stop()
     settle(tab)
     commit()
     app.applicationStateChanged.emit(Qt.ApplicationState.ApplicationActive)
@@ -142,7 +140,7 @@ def run():
     viewer.close()
     wait_until(lambda: tab._git_viewer is None)
     settle(tab)
-    print("[OK] polling, application focus, project visibility, branch changes and reverse synchronization", flush=True)
+    print("[OK] file watching, application focus, project visibility, branch changes and reverse synchronization", flush=True)
 
     # 主动请求撞上慢任务时只补一轮，避免请求丢失或堆积。
     (root / "file-0.txt").write_text("pending\n", encoding="utf-8")

@@ -105,6 +105,14 @@ class ProjectServiceController:
 
     def request_gui(self, action: str, module=None) -> dict:
         from PySide6.QtWidgets import QMessageBox
+        from src.core.usage_stats import usage_stats
+
+        started = time.perf_counter()
+
+        def record(result):
+            usage_stats.record_gui(f"service:{action}", ok=bool(result.get("ok")),
+                                   duration_ms=(time.perf_counter() - started) * 1000)
+
         tab = self.tab
         if tab.project_meta.spring_boot_modules:
             tab._detect_and_apply_external()
@@ -116,8 +124,11 @@ class ProjectServiceController:
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
-                return {"ok": False, "error": "cancelled"}
+                result = {"ok": False, "error": "cancelled"}
+                record(result)
+                return result
         def completed(result):
+            record(result)
             if not result.get("ok") and result.get("error") not in ("already running", "not running"):
                 self.tab.log.append_line("stderr", f"[服务操作失败] {result.get('error', '')}")
             self.tab._refresh_status_row()

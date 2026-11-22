@@ -13,7 +13,7 @@ CLI 的 `--log/--diagnose --current-run` 使用启动代次内独立的原始输
 - 基础 logger：`mini-ide`
 - 行为 logger：`mini-ide.action`，通过父 logger 写入同一日志文件。
 - 单文件最大 5 MB，保留 3 个轮转副本。
-- 启动时清理超过 14 天的日志。
+- 启动时按修改时间清理超过 14 天的应用日志及轮转文件，以及日志目录直属的业务服务 `*.log` 文件。
 - GUI 菜单“帮助 → 打开 mini-ide 日志”和“打开日志目录”可直接访问。
 
 ## CLI 行为日志
@@ -57,6 +57,8 @@ perf op=<操作> duration_ms=<毫秒> files=<数量> matches=<数量> status=<�
 ~~~
 
 当前覆盖会话恢复、文件索引、文件监控启动、文件名搜索、全局内容搜索、目录扫描与批量渲染、日志慢批次渲染、Git 状态/分支/脏检查/概览/diff worker、Git 结果渲染、状态轮询、资源守卫和 UI 事件循环延迟。文件监控日志使用 `file-watchdog-start`；目录日志使用 `directory-scan` 和 `directory-render`；日志单批渲染超过 100ms 时记录 `log-render`。这些日志只记录耗时与数量。搜索日志只记录 `query_len`，不记录搜索文本或文件内容。事件循环额外延迟达到 250ms 会记录 `ui-stall`；现有超过 3 秒的 freeze watchdog 线程栈仍保留。
+
+Git 状态查询在项目页显示、应用激活、项目文件变化或 Git 操作后触发；文件变化按 1.5 秒合并。前台可见的项目会在距上次查询至少 30 秒时补查。`git-status-worker` 仅在成功查询耗时达到 200ms 时记录性能日志，异常仍单独记录。
 
 应用真正退出时，若仍有搜索线程，`mini-ide.search_lifecycle` 会记录停止与等待结果；正常关闭窗口只隐藏到托盘，不触发该清理。
 

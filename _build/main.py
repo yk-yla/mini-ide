@@ -106,10 +106,7 @@ def _start_local_server(window: MainWindow) -> QLocalServer | None:
         return None
 
     def _on_new_connection():
-        from src.core.cli_server import (
-            _send_response, handle_async_cli_request, handle_cli_request,
-        )
-        import json
+        from src.core.cli_server import _send_response, handle_cli_request
 
         sock = server.nextPendingConnection()
         if sock is None:
@@ -119,26 +116,17 @@ def _start_local_server(window: MainWindow) -> QLocalServer | None:
         else:
             data = ""
 
-        # 尝试作为 CLI JSON 命令处理
-        if data.startswith("{"):
-            try:
-                cmd = json.loads(data)
-                if "cmd" in cmd:
-                    # 异步命令（health / compile）需要保持连接
-                    if handle_async_cli_request(cmd, sock, window):
-                        return
-                    # 同步命令
-                    if handle_cli_request(data, sock, window):
-                        return
-            except json.JSONDecodeError:
-                pass
-            except Exception as exc:
-                app_log.get_logger("main").exception("异步 CLI 命令执行异常")
-                _send_response(sock, {
-                    "ok": False,
-                    "error": f"cli command failed: {type(exc).__name__}: {exc}",
-                })
-                return
+        try:
+            handled = handle_cli_request(data, sock, window)
+        except Exception as exc:
+            app_log.get_logger("main").exception("CLI 命令处理异常")
+            _send_response(sock, {
+                "ok": False,
+                "error": f"cli command failed: {type(exc).__name__}: {exc}",
+            })
+            return
+        if handled:
+            return
 
         # 老协议：打开项目路径
         window.activate_and_open(data or None)

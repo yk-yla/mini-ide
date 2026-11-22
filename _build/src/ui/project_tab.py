@@ -1,6 +1,6 @@
 """单项目 Tab 面板
 
-把 项目元信息 / 工具栏按钮 / 日志 / 设置面板 / 状态条 / 进程运行器 串起来。
+把项目元信息、工具栏、日志、状态条和进程运行器串起来。
 """
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import re
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton,
-    QSplitter, QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget,
+    QSplitter, QStackedWidget, QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from src.core.config import AppConfig, ProjectEntry
@@ -34,9 +34,12 @@ from src.core.service_state import (
     STATE_STOPPED as SERVICE_STOPPED, STATE_STOPPING as SERVICE_STOPPING,
     ServiceState, running_items,
 )
+from src.core.usage_stats import usage_stats
+from src.ui.cockpit_panel import ProjectCockpitPanel
 from src.ui.file_tree import FileTree
 from src.ui.content_search import ContentSearchDialog
 from src.ui.git_viewer import GitViewer
+from src.ui.icons import icon, project_icon_name
 from src.ui.log_widget import LogWidget
 from src.ui.project_service_controller import ProjectServiceController
 from src.ui.quick_open import (
@@ -46,12 +49,11 @@ from src.ui.service_panel import (
     STATE_IDLE, STATE_RUNNING, STATE_RUNNING_EXTERNAL, STATE_STARTING,
     STATE_STOPPING, ServicePanel,
 )
-from src.ui.settings_panel import SettingsPanel
 from src.ui.theme import (
-    BG_BTN, BG_BTN_HOVER, BG_BTN_PRESSED, BG_L1, BG_L4,
+    BG_BTN, BG_BTN_HOVER, BG_BTN_PRESSED, BG_L4,
     BORDER_STRONG, BORDER_SUBTLE, COLOR_SUCCESS, COLOR_WARN,
     FG_DIM, FG_PRIMARY, FG_SECONDARY,
-    FONT_PT_UI_SM, RADIUS_SM,
+    FG_ON_ACCENT, COLOR_ERROR, FONT_PT_UI_SM, GAP_SM, GAP_MD, RADIUS_SM,
 )
 from src.util import git_info, notify
 from src.util.editor import (
@@ -63,6 +65,8 @@ from src.util.editor import (
 # 顶层调谐常量（提到顶部方便统一调，避免散在各方法里成 magic number）
 LEFT_PANEL_WIDTH = 240
 STATUS_REFRESH_MS = 3000
+GIT_REFRESH_FALLBACK_SECONDS = 30
+GIT_FILE_REFRESH_DEBOUNCE_MS = 1500
 GIT_FETCH_INTERVAL_MS = 5 * 60 * 1000
 GIT_FETCH_INITIAL_DELAY_MS = 8000
 MODULE_STOP_TIMEOUT_MS = 10000
@@ -148,6 +152,21 @@ _RE_BOOT_LISTEN_PORT = re.compile(
 )
 
 
+class _ProjectCenterTabs(QTabWidget):
+    tabs_changed = Signal()
+
+    def tabInserted(self, index):
+        self.tabs_changed.emit()
+
+    def tabRemoved(self, index):
+        self.tabs_changed.emit()
+
+    def setTabVisible(self, index, visible):
+        if self.isTabVisible(index) != visible:
+            super().setTabVisible(index, visible)
+            self.tabs_changed.emit()
+
+
 class ProjectTab(QWidget):
 
     statusChanged = Signal()   # 状态变化时通知主窗口刷新状态栏
@@ -184,6 +203,7 @@ class ProjectTab(QWidget):
         self._runtime_stop_runners: dict[str, ProcessRunner] = {}
         # 模块启动日志里抓到的真实监听端口（覆盖 application.yml 默认值）
         self._module_ports: dict[str, int] = {}
+        self._run_port: int | None = None
         # 用户关 tab 触发 stop 的模块集合；finished 时自动清理 tab
         self._closing_modules: set[str] = set()
         # 「外部启动感知」：非 mini-ide 拉起、但端口快照里按 cmdline 匹配到的模块 → pid。
@@ -229,6 +249,11 @@ class ProjectTab(QWidget):
         self._git_ignored: set[str] = set()
         self._git_status_pending = False
         self._git_refresh_enabled = True
+        self._last_git_refresh = float("-inf")
+        self._git_file_timer = QTimer(self)
+        self._git_file_timer.setSingleShot(True)
+        self._git_file_timer.setInterval(GIT_FILE_REFRESH_DEBOUNCE_MS)
+        self._git_file_timer.timeout.connect(self._refresh_git_after_file_change)
         self._git_viewer = None
         self._merge_dialog = None
         # 启动完成标记：日志里看到 Started / ready in 等 marker 后，只给状态栏贴一次"✓ 启动完成"
@@ -236,10 +261,12 @@ class ProjectTab(QWidget):
         self._recent_files: list[str] = []     # 最近在预览里打开的文件
 
         self.indexer = FileIndexer(self.project_meta.path, self)
+        for signal in (self.indexer.file_added, self.indexer.file_removed, self.indexer.file_modified):
+            signal.connect(self._schedule_git_file_refresh, Qt.ConnectionType.QueuedConnection)
         self.indexer.start_async_scan()
         # 接口跳转索引：懒加载，首次按 Ctrl+/ 才扫（见 open_endpoint_picker）
         self._controller_indexer = None
-        self._endpoint_dialog = None
+        self.navigation_host = self
 
         self._build_ui()
         self._register_shortcuts()
@@ -318,15 +345,16 @@ class ProjectTab(QWidget):
         self.log.fileJumpRequested.connect(self._jump_to_file)
 
         # 中心 Tab 容器：tab 0 固定是日志（不可关），其它 tab 是文件面板
-        self.center_tabs = QTabWidget()
+        self.center_tabs = _ProjectCenterTabs()
         self.center_tabs.setTabsClosable(True)
         self.center_tabs.setMovable(True)
         self.center_tabs.setDocumentMode(True)
         self.center_tabs.tabCloseRequested.connect(self._on_tab_close_requested)
         self.center_tabs.currentChanged.connect(self._on_center_tab_changed)
-        self.center_tabs.addTab(self.log, "📋 日志")
+        self.center_tabs.addTab(self.log, icon("terminal"), "日志")
         # 锁定日志 tab 的关闭按钮（两侧都清空，兼容不同平台默认位置）
         _bar = self.center_tabs.tabBar()
+        _bar.tabMoved.connect(self._keep_project_log_first)
         _bar.setTabButton(0, QTabBar.ButtonPosition.RightSide, None)
         _bar.setTabButton(0, QTabBar.ButtonPosition.LeftSide, None)
         # 多模块（微服务）项目：项目级日志平时是空的（各模块输出进各自 tab），
@@ -341,7 +369,27 @@ class ProjectTab(QWidget):
         # 已打开文件去重：key = abs_path.lower() → FilePreviewPane
         self._file_panes: dict[str, object] = {}
 
-        self.splitter.addWidget(self.center_tabs)
+        self.cockpit = ProjectCockpitPanel(
+            self.project_meta, has_endpoints=self.has_java_stack,
+            resolve_event_log=lambda target: self.navigation_host.resolve_activity_log(self, target),
+        )
+        self.cockpit.file_search_requested.connect(lambda: self.navigation_host.open_file_picker())
+        self.cockpit.content_search_requested.connect(lambda: self.navigation_host.open_content_search())
+        self.cockpit.endpoint_search_requested.connect(lambda: self.navigation_host.open_endpoint_picker())
+        self.cockpit.log_requested.connect(self._focus_cockpit_log)
+        self.cockpit.event_log_requested.connect(
+            lambda target: self.navigation_host.open_activity_log(self, target)
+        )
+        self.cockpit.service_requested.connect(self.service_controller.request_gui)
+        self.center_stack = QStackedWidget()
+        self.center_stack.addWidget(self.cockpit)
+        self.center_stack.addWidget(self.center_tabs)
+        self.center_tabs.tabs_changed.connect(self._sync_center_view)
+        self.statusChanged.connect(self._refresh_cockpit_services)
+        self._refresh_cockpit_services()
+        self._sync_center_view()
+        self.refresh_theme()
+        self.splitter.addWidget(self.center_stack)
         self.splitter.setSizes([LEFT_PANEL_WIDTH, 1100])
 
         root.addWidget(self.splitter, 1)
@@ -350,14 +398,13 @@ class ProjectTab(QWidget):
         bar = QFrame()
         bar.setObjectName("top_toolbar")
         bar.setFrameShape(QFrame.Shape.NoFrame)
-        bar.setStyleSheet(
-            f"#top_toolbar {{ background:{BG_L1}; border-bottom:1px solid {BORDER_SUBTLE}; }}"
-        )
         lay = QHBoxLayout(bar)
-        lay.setContentsMargins(10, 6, 10, 6)
-        lay.setSpacing(6)
+        lay.setContentsMargins(GAP_MD, GAP_SM, GAP_MD, GAP_SM)
+        lay.setSpacing(GAP_SM)
 
-        type_lbl = QLabel(f"{self.project_meta.icon}  {self.project_meta.display_type}")
+        self._project_type_icon = QLabel()
+        lay.addWidget(self._project_type_icon)
+        type_lbl = QLabel(self.project_meta.display_type)
         type_lbl.setProperty("role", "title")
         lay.addWidget(type_lbl)
 
@@ -394,9 +441,7 @@ class ProjectTab(QWidget):
             )
             if build_prof:
                 self._build_profile = build_prof
-                self.btn_build = QPushButton(
-                    f"{build_prof.icon}  {build_prof.label}" if build_prof.icon else build_prof.label
-                )
+                self.btn_build = QPushButton(build_prof.label)
                 self.btn_build.setToolTip(
                     build_prof.description or " ".join(build_prof.command)
                 )
@@ -404,6 +449,13 @@ class ProjectTab(QWidget):
                 lay.addWidget(self.btn_build)
 
         lay.addStretch(1)
+
+        self.btn_overview = QToolButton()
+        self.btn_overview.setText("概览")
+        self.btn_overview.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn_overview.setCheckable(True)
+        self.btn_overview.clicked.connect(self._toggle_overview)
+        lay.addWidget(self.btn_overview)
 
         # 运行计数 / 启动完成提示（原状态行，已并入本工具栏，靠右显示）
         self.lbl_elapsed = QLabel("")
@@ -416,6 +468,7 @@ class ProjectTab(QWidget):
 
         # 分支按钮：点击弹出菜单复制分支名
         self.btn_branch = QToolButton()
+        self.btn_branch.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.btn_branch.setText("")
         self.btn_branch.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.btn_branch.setToolTip("点击复制分支名")
@@ -433,6 +486,7 @@ class ProjectTab(QWidget):
 
         # 改动按钮：紧贴分支按钮，显示本地改动文件数，点击打开 GitViewer
         self.btn_changes = QToolButton()
+        self.btn_changes.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.btn_changes.setText("")
         self.btn_changes.setToolTip("查看当前分支改动文件")
         self.btn_changes.clicked.connect(self.open_git_viewer)
@@ -441,13 +495,100 @@ class ProjectTab(QWidget):
 
         return bar
 
+    @property
+    def has_java_stack(self) -> bool:
+        return project_icon_name(self.project_meta.project_type) == "coffee"
+
+    def _keep_project_log_first(self, _old, _new):
+        index = self.center_tabs.indexOf(self.log)
+        if index > 0:
+            self.center_tabs.tabBar().moveTab(index, 0)
+
+    def _has_visible_center_tab(self) -> bool:
+        return any(self.center_tabs.isTabVisible(index) for index in range(self.center_tabs.count()))
+
+    def _show_center_view(self, overview: bool) -> None:
+        self.center_stack.setCurrentWidget(self.cockpit if overview else self.center_tabs)
+        self.btn_overview.setChecked(overview)
+        self.btn_overview.setToolTip("查看文件和日志" if overview else "查看运行概览")
+
+    def _sync_center_view(self) -> None:
+        self._show_center_view(not self._has_visible_center_tab())
+
+    def _toggle_overview(self) -> None:
+        show_overview = self.center_stack.currentWidget() is not self.cockpit
+        if not show_overview and not self._has_visible_center_tab():
+            self._reveal_log_tab()
+        self._show_center_view(show_overview)
+
+    def _focus_cockpit_log(self, module: str) -> None:
+        if module:
+            self._focus_module_log(module)
+        else:
+            self._reveal_log_tab()
+            self.center_tabs.setCurrentWidget(self.log)
+            self._show_center_view(False)
+
+    def match_activity_log(self, target: str, component_names=()) -> str | None:
+        key = target.casefold()
+        if not key:
+            return None
+        meta = self.project_meta
+        if self._is_multi_module or component_names:
+            matches = [unit.id for unit in meta.runtime_units
+                       if key in (unit.id.casefold(), unit.name.casefold())]
+            if len(matches) == 1:
+                return matches[0] if self._is_multi_module else ""
+            if matches:
+                return None
+        if not self._is_multi_module or component_names:
+            names = (meta.name, Path(meta.path).name, *component_names)
+            if key in {name.casefold() for name in names}:
+                return ""
+        return None
+
+    def resolve_activity_log(self, source, target: str):
+        module = source.match_activity_log(target)
+        return (source, module) if module is not None else None
+
+    def open_activity_log(self, source, target: str) -> None:
+        destination = self.resolve_activity_log(source, target)
+        if destination is not None:
+            tab, module = destination
+            tab.focus_activity_log(module)
+
+    def focus_activity_log(self, module: str) -> None:
+        if module:
+            self._ensure_module_log_tab(module)
+        self._focus_cockpit_log(module)
+
+    def _refresh_cockpit_services(self) -> None:
+        self.cockpit.update_services(self.service_states(refresh_external=False))
+
+    def refresh_theme(self) -> None:
+        self._project_type_icon.setPixmap(icon(project_icon_name(self.project_meta.project_type)).pixmap(QSize(16, 16)))
+        self.btn_overview.setIcon(icon("dashboard"))
+        self.btn_main.setIcon(icon(*getattr(self, "_main_icon", ("play", FG_ON_ACCENT))))
+        if self._build_profile:
+            self.btn_build.setIcon(icon("lock"))
+        self._render_git_status_row(self._git_info)
+        for widget, glyph in (
+            (self.log, "terminal"),
+            *((widget, "terminal") for widget in self.module_logs.values()),
+            *((widget, "terminal") for widget in self._script_logs.values()),
+            *((widget, "file") for widget in self._file_panes.values()),
+        ):
+            index = self.center_tabs.indexOf(widget)
+            if index >= 0:
+                self.center_tabs.setTabIcon(index, icon(glyph))
+
     # ---- 动作 ----
 
-    def _run_profile(self, prof: RunProfile) -> None:
+    def _run_profile(self, prof: RunProfile) -> bool:
         conflict = self.service_controller.operation_error()
         if conflict:
             self.log.append_line("stderr", f"[操作已阻止] {conflict['error']}")
-            return
+            return False
         if self.service_controller.runner_busy(self.runner):
             ret = QMessageBox.question(
                 self, "已有任务在运行",
@@ -455,22 +596,22 @@ class ProjectTab(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if ret != QMessageBox.StandardButton.Yes:
-                return
+                return False
             # 事件驱动重启：记下待启动 profile，停止完成后由 _on_finished 接力，
             # 不赌固定延时——慢停止时既不会重复弹框，也不会叠加定时器。
             self._pending_restart = prof
-            self._stop()
-            return
+            return self._stop()
 
         # 启动前强制编译
         if prof.pre_compile:
             compile_prof = self._find_compile_profile()
             if compile_prof and compile_prof.name != prof.name:
                 self._pending_after_compile = prof
-                if not self._start_profile(compile_prof):
+                started = self._start_profile(compile_prof)
+                if not started:
                     self._pending_after_compile = None
-                return
-        self._start_profile(prof)
+                return started
+        return self._start_profile(prof)
 
     def _find_compile_profile(self) -> RunProfile | None:
         for p in self.project_meta.profiles:
@@ -537,35 +678,42 @@ class ProjectTab(QWidget):
         elif self.service_controller.runner_busy(self.runner):
             self.service_controller.request_gui("stop")
         elif self._primary_profile:
-            self._run_profile(self._primary_profile)
+            started = time.perf_counter()
+            ok = self._run_profile(self._primary_profile)
+            usage_stats.record_gui("service:start", ok=ok, duration_ms=(time.perf_counter() - started) * 1000)
 
     def _update_main_button(self, state: str) -> None:
         btn = self.btn_main
         if state == "running":
-            btn.setText("⏹  停止")
+            btn.setText("停止")
+            self._main_icon = ("stop", COLOR_ERROR)
             btn.setProperty("role", "danger")
             btn.setToolTip("停止当前运行的进程（递归杀进程树）")
             btn.setEnabled(True)
         elif state == "starting":
-            btn.setText("⏳  启动中...")
+            btn.setText("启动中…")
+            self._main_icon = ("activity", FG_DIM)
             btn.setToolTip("正在启动...")
             btn.setEnabled(False)
         elif state == "stopping":
-            btn.setText("⏳  停止中...")
+            btn.setText("停止中…")
+            self._main_icon = ("activity", FG_DIM)
             btn.setToolTip("正在停止...")
             btn.setEnabled(False)
         else:   # idle
             p = self._primary_profile
             if p:
-                btn.setText(f"{p.icon}  {p.label}" if p.icon else p.label)
+                btn.setText(p.label)
                 btn.setToolTip(p.description or " ".join(p.command))
             else:
-                btn.setText("▶  启动")
+                btn.setText("启动")
                 btn.setToolTip("(未识别出主启动命令)")
                 btn.setEnabled(False)
                 return
             btn.setProperty("role", "primary")
             btn.setEnabled(True)
+            self._main_icon = ("play", FG_ON_ACCENT)
+        btn.setIcon(icon(*self._main_icon))
         btn.style().unpolish(btn)
         btn.style().polish(btn)
 
@@ -619,7 +767,7 @@ class ProjectTab(QWidget):
         lw.set_max_blocks(self.config.max_log_blocks)
         lw.fileJumpRequested.connect(self._jump_to_file)
         self.module_logs[module] = lw
-        idx = self.center_tabs.addTab(lw, f"📋 {module}")
+        idx = self.center_tabs.addTab(lw, icon("terminal"), module)
         self.center_tabs.setCurrentIndex(idx)
         return lw
 
@@ -1047,6 +1195,7 @@ class ProjectTab(QWidget):
             idx = self.center_tabs.indexOf(lw)
             if idx >= 0:
                 self.center_tabs.setCurrentIndex(idx)
+                self._show_center_view(False)
                 return
         pid = self._module_external_pids.get(module)
         if pid is not None:
@@ -1060,12 +1209,16 @@ class ProjectTab(QWidget):
             )
             self._reveal_log_tab()
             self.center_tabs.setCurrentWidget(self.log)
+            self._show_center_view(False)
             return
         # 模块还没启动过：提示用户先启动
         self.log.append_line(
             "meta",
                 f"[提示] {module} 还未启动；点击其右侧的 ▶ 按钮。",
         )
+        self._reveal_log_tab()
+        self.center_tabs.setCurrentWidget(self.log)
+        self._show_center_view(False)
 
     def focus_runtime_unit(self, unit_id: str) -> None:
         """供聚合项目树定位运行单元；详情仍复用完整 ProjectTab。"""
@@ -1083,6 +1236,7 @@ class ProjectTab(QWidget):
             m = _RE_BOOT_LISTEN_PORT.search(line)
             if m:
                 self._module_ports[module] = int(m.group(1))
+                self._refresh_cockpit_services()
                 r = self.module_runners.get(module)
                 # 必须确认 runner 仍在跑——_on_finished 里 flush 残留日志会
                 # 在切 idle 前 emit 这行，没这层守卫会把 panel 刷回 RUNNING
@@ -1225,7 +1379,7 @@ class ProjectTab(QWidget):
                 state=SERVICE_STARTING,
                 source=SOURCE_MANAGED_RUNNER,
                 pid=self.runner.process_id(),
-                port=single_port,
+                port=self._run_port or single_port,
                 expected_port=single_port,
                 log_attached=True,
                 checked_at=checked_at,
@@ -1242,7 +1396,7 @@ class ProjectTab(QWidget):
                 state=SERVICE_RUNNING_MANAGED,
                 source=SOURCE_MANAGED_RUNNER,
                 pid=pid if pid and pid > 0 else None,
-                port=single_port,
+                port=self._run_port or single_port,
                 expected_port=single_port,
                 log_attached=True,
                 checked_at=checked_at,
@@ -1521,11 +1675,12 @@ class ProjectTab(QWidget):
             lw.set_max_blocks(self.config.max_log_blocks)
             lw.fileJumpRequested.connect(self._jump_to_file)
             self._script_logs[key] = lw
-            idx = self.center_tabs.addTab(lw, f"▶ {p.name}")
+            idx = self.center_tabs.addTab(lw, icon("terminal"), p.name)
         else:
             # 复用已有 LogWidget：保留上次输出，begin_run 会贴新 banner 区分两轮
             idx = self.center_tabs.indexOf(lw)
         self.center_tabs.setCurrentIndex(idx)
+        self._show_center_view(False)
 
         runner = self._script_runners.get(key)
         if runner is None:
@@ -1598,6 +1753,11 @@ class ProjectTab(QWidget):
     def _on_output(self, stream: str, line: str) -> None:
         self.service_controller.record_service_output(None, line)
         self.log.append_line(stream, line)
+        if self._run_port is None and self._current_profile and self._current_profile.kind == "run":
+            match = _RE_BOOT_LISTEN_PORT.search(line)
+            if match:
+                self._run_port = int(match.group(1))
+                self._refresh_cockpit_services()
         # 日志里识别到启动完成 marker 后，状态栏贴一次"✓ 启动完成"（仅状态栏，不弹系统通知）
         if not self._startup_phase_marked and self._current_profile and self._current_profile.kind == "run":
             markers = ("Started ", "ready in ", "compiled successfully", "Netty started on port", "Tomcat started on port")
@@ -1610,6 +1770,8 @@ class ProjectTab(QWidget):
         # 顶部运行状态圆点/文字已移除；启动完成的 ✓ 提示仍由 lbl_phase 显示，
         # 运行/停止状态主要靠主按钮的形态表达。
         self._update_main_button(state)
+        if state == "idle":
+            self._run_port = None
 
         self.statusChanged.emit()
 
@@ -1724,6 +1886,8 @@ class ProjectTab(QWidget):
             return
         started = time.perf_counter()
         self._refresh_status_row()
+        if time.monotonic() - self._last_git_refresh >= GIT_REFRESH_FALLBACK_SECONDS:
+            self._request_git_refresh()
         duration_ms = (time.perf_counter() - started) * 1000
         if duration_ms >= 50:
             perf_log.warning(
@@ -1746,11 +1910,25 @@ class ProjectTab(QWidget):
 
     def _on_application_state_changed(self, state) -> None:
         if state == Qt.ApplicationState.ApplicationActive:
-            self._request_git_refresh()
+            self._request_git_refresh(force=True)
 
-    def _request_git_refresh(self) -> None:
-        if self.isVisible():
-            self._update_file_tree_git_colors(force=True)
+    def _can_refresh_git(self) -> bool:
+        return (self._git_refresh_enabled and self._is_git_repo and self.isVisible()
+                and not self.window().isMinimized()
+                and QApplication.applicationState() == Qt.ApplicationState.ApplicationActive
+                and not QApplication.instance().property("mini_ide_shutting_down"))
+
+    def _request_git_refresh(self, force: bool = False) -> None:
+        if self._can_refresh_git():
+            self._git_file_timer.stop()
+            self._update_file_tree_git_colors(force=force)
+
+    def _schedule_git_file_refresh(self, _path: str) -> None:
+        if self._can_refresh_git():
+            self._git_file_timer.start()
+
+    def _refresh_git_after_file_change(self) -> None:
+        self._request_git_refresh(force=True)
 
     def _refresh_status_row(self) -> None:
         if self._is_multi_module:
@@ -1793,6 +1971,8 @@ class ProjectTab(QWidget):
                     running += 1
                     pid, port = external[mod_name]
                     self._module_external_pids[mod_name] = pid
+                    if port:
+                        self._module_ports[mod_name] = port
                     if self.service_panel:
                         self.service_panel.update_state(
                             mod_name, STATE_RUNNING_EXTERNAL, port=port,
@@ -1837,25 +2017,23 @@ class ProjectTab(QWidget):
             self.lbl_elapsed.setText(f"已运行 {h}:{m:02d}:{s:02d}" if h else f"已运行 {m}:{s:02d}")
         else:
             self.lbl_elapsed.setText("")
-
-        # git 分支 / 改动数 / 文件树染色：全部交给后台 worker 查，
-        # 主线程不再同步跑 git 命令（否则大仓库每 3s 冻 UI 几百 ms）。
-        # 本地状态先渲染，忽略文件与上游统计由独立后台任务补充。
-        self._update_file_tree_git_colors()
+        self._refresh_cockpit_services()
 
     def _render_git_status_row(self, info) -> None:
         """用后台查到的 GitInfo 渲染分支按钮 + 改动数按钮（在主线程回调里调）。"""
-        text = git_info.format_status(info)
+        text = git_info.format_status(info).removeprefix("🌿 ")
         if text:
             self.btn_branch.setText(text + "  ▾")
             base = _status_btn_base_qss()
             # behind > 0 → 橙色高亮提示远程有新提交，点开菜单复制分支名
             if info and info.behind > 0:
+                self.btn_branch.setIcon(icon("git_branch", COLOR_WARN))
                 self.btn_branch.setStyleSheet(base + f"QToolButton {{ color:{COLOR_WARN}; }}")
                 self.btn_branch.setToolTip(
                     f"远程有 {info.behind} 个新提交；点击菜单可复制分支名给 AI"
                 )
             else:
+                self.btn_branch.setIcon(icon("git_branch"))
                 self.btn_branch.setStyleSheet(base + f"QToolButton {{ color:{FG_SECONDARY}; }}")
                 self.btn_branch.setToolTip("点击选择要复制的分支名")
             self.btn_branch.setVisible(True)
@@ -1867,24 +2045,18 @@ class ProjectTab(QWidget):
             n = info.changed
             base = _status_btn_base_qss()
             if n > 0:
-                self.btn_changes.setText(f"📝 {n} 处改动")
+                self.btn_changes.setText(f"{n} 处改动")
+                self.btn_changes.setIcon(icon("git_diff", COLOR_WARN))
                 self.btn_changes.setStyleSheet(base + f"QToolButton {{ color:{COLOR_WARN}; }}")
             else:
-                self.btn_changes.setText("📝 无改动")
+                self.btn_changes.setText("无改动")
+                self.btn_changes.setIcon(icon("git_diff", FG_DIM))
                 self.btn_changes.setStyleSheet(base + f"QToolButton {{ color:{FG_DIM}; }}")
             self.btn_changes.setVisible(True)
         else:
             self.btn_changes.setVisible(False)
 
     def _update_file_tree_git_colors(self, force: bool = False) -> None:
-        if (not self._git_refresh_enabled
-                or QApplication.instance().property("mini_ide_shutting_down")):
-            return
-        # 非 git 项目：状态栏隐藏分支/改动按钮，不起 worker
-        if not self._is_git_repo:
-            self.btn_branch.setVisible(False)
-            self.btn_changes.setVisible(False)
-            return
         # 定时请求不堆积；主动刷新最多补一轮，finished 清引用后再回收线程。
         w = self._git_status_worker
         if w is not None:
@@ -1902,6 +2074,7 @@ class ProjectTab(QWidget):
         worker.finished.connect(worker.deleteLater)
         self._git_status_worker = worker
         self._git_status_pending = False
+        self._last_git_refresh = time.monotonic()
         worker.start()
 
     def _on_git_snapshot_ready(self, snapshot) -> None:
@@ -1910,8 +2083,11 @@ class ProjectTab(QWidget):
         if self._git_snapshot and snapshot.started_ns <= self._git_snapshot.started_ns:
             return
         self._git_snapshot = snapshot
+        self._last_git_refresh = time.monotonic()
         previous = self._git_info
         same_branch = previous and previous.branch == snapshot.branch
+        if previous and not same_branch:
+            git_info.invalidate(self.project_meta.path)
         self._git_info = git_info.GitInfo(
             branch=snapshot.branch, changed=len(snapshot.files), dirty=bool(snapshot.files),
             ahead=previous.ahead if same_branch else 0,
@@ -1927,9 +2103,7 @@ class ProjectTab(QWidget):
         self._start_git_details()
 
     def _start_git_details(self) -> None:
-        if (not self._git_refresh_enabled or self._git_snapshot is None
-                or not self.isVisible()
-                or QApplication.instance().property("mini_ide_shutting_down")):
+        if self._git_snapshot is None or not self._can_refresh_git():
             return
         if self._git_details_worker is not None:
             return
@@ -1998,11 +2172,12 @@ class ProjectTab(QWidget):
             self._show_preview(path, line, col)
 
     def _show_preview(self, path: str, line: int, col: int) -> None:
-        """在中心 tab 区打开文件：同文件已开则聚焦，否则新建 tab（默认编辑模式）"""
+        """在中心 tab 区打开文件：同文件已开则聚焦，否则新建预览。"""
         from pathlib import Path
         # 办公文档不进内置预览，直接交给系统默认程序（git 改动/环境面板等入口也会走到这）
         if is_office_doc(path) and open_with_system_default(path):
             return
+        usage_stats.record_gui("file:open_preview")
         p = Path(path)
         if not p.is_absolute():
             from src.util.editor import search_in_project
@@ -2017,6 +2192,7 @@ class ProjectTab(QWidget):
             idx = self.center_tabs.indexOf(existing)
             if idx >= 0:
                 self.center_tabs.setCurrentIndex(idx)
+                self._show_center_view(False)
                 if line > 0:
                     existing.goto_line(line, col)
                 existing.setFocus()
@@ -2034,12 +2210,13 @@ class ProjectTab(QWidget):
         pane.dirtyChanged.connect(
             lambda dirty, pn=pane: self._on_pane_dirty_changed(pn, dirty)
         )
+        pane.saved.connect(self._schedule_git_file_refresh)
         label = Path(path).name
         try:
             rel = str(Path(path).relative_to(self.project_meta.path))
         except ValueError:
             rel = path
-        idx = self.center_tabs.addTab(pane, label)
+        idx = self.center_tabs.addTab(pane, icon("file"), label)
         self.center_tabs.setTabToolTip(idx, rel)
         self._file_panes[key] = pane
         self.center_tabs.setCurrentIndex(idx)
@@ -2047,7 +2224,8 @@ class ProjectTab(QWidget):
         self.file_tree.reveal_path(path)
 
     def _on_file_created(self, path: str) -> None:
-        """文件树新建文件后：直接在 tab 区打开（本来就是默认编辑模式）"""
+        """文件树新建文件后直接打开预览。"""
+        self._schedule_git_file_refresh(path)
         self._show_preview(path, 0, 0)
 
     def _tab_key(self, path: str) -> str:
@@ -2066,6 +2244,8 @@ class ProjectTab(QWidget):
         self.center_tabs.setTabText(idx, f"{name} *" if dirty else name)
 
     def _on_center_tab_changed(self, index: int) -> None:
+        if hasattr(self, "center_stack"):
+            self._sync_center_view()
         if index <= 0:
             return
         widget = self.center_tabs.widget(index)
@@ -2296,7 +2476,7 @@ class ProjectTab(QWidget):
             self._git_fetch_worker = None
         if ok:
             git_info.invalidate(self.project_meta.path)
-            self._refresh_status_row()
+            self._request_git_refresh(force=True)
             notify.notify_success("刷新远程分支", "远程分支已更新")
             self._branch_menu.popup(QCursor.pos())
         else:
@@ -2307,7 +2487,7 @@ class ProjectTab(QWidget):
         if self._git_fetch_worker and self._git_fetch_worker.isRunning():
             return
         path = self.project_meta.path
-        if not self._is_git_repo:
+        if not self._can_refresh_git():
             return
         self._git_fetch_worker = GitFetchWorker(
             path, parent=self, require_upstream=True,
@@ -2322,7 +2502,7 @@ class ProjectTab(QWidget):
         if not ok:
             return
         git_info.invalidate(self.project_meta.path)
-        self._refresh_status_row()
+        self._request_git_refresh(force=True)
 
     def _do_checkout(self, branch: str) -> None:
         self._check_dirty_before_checkout(False, branch)
@@ -2387,7 +2567,7 @@ class ProjectTab(QWidget):
         if self.sender() is self._git_checkout_worker:
             self._git_checkout_worker = None
         git_info.invalidate(self.project_meta.path)
-        self._refresh_status_row()
+        self._request_git_refresh(force=True)
         if ok:
             target = self._checkout_target
             self._checkout_target = ""
@@ -2400,7 +2580,7 @@ class ProjectTab(QWidget):
         if self.sender() is self._git_checkout_remote_worker:
             self._git_checkout_remote_worker = None
         git_info.invalidate(self.project_meta.path)
-        self._refresh_status_row()
+        self._request_git_refresh(force=True)
         if ok:
             target = self._checkout_target
             if "/" in target:
@@ -2432,7 +2612,7 @@ class ProjectTab(QWidget):
         if self.sender() is self._git_delete_branch_worker:
             self._git_delete_branch_worker = None
         git_info.invalidate(self.project_meta.path)
-        self._refresh_status_row()
+        self._request_git_refresh(force=True)
         if ok:
             notify.notify_success("本地分支已删除", msg)
         else:
@@ -2469,7 +2649,7 @@ class ProjectTab(QWidget):
         if self.sender() is self._git_merge_worker:
             self._git_merge_worker = None
         git_info.invalidate(self.project_meta.path)
-        self._refresh_status_row()
+        self._request_git_refresh(force=True)
         if ok:
             QMessageBox.information(self, "合并推送完成", msg)
         else:
@@ -2516,6 +2696,7 @@ class ProjectTab(QWidget):
     def suspend_background_tasks(self) -> tuple[bool, bool]:
         self._git_refresh_enabled = False
         self._git_status_pending = False
+        self._git_file_timer.stop()
         polling = (self._poll_timer.isActive() or self._poll_start_timer.isActive(),
                    self._fetch_timer.isActive() or self._fetch_start_timer.isActive())
         self._poll_timer.stop()
@@ -2528,6 +2709,7 @@ class ProjectTab(QWidget):
         if self._controller_indexer is not None:
             self._controller_indexer.stop()
         self.file_tree.stop_workers()
+        self.cockpit.stop()
         return polling
 
     def resume_background_tasks(self, polling: tuple[bool, bool]) -> None:
@@ -2585,6 +2767,7 @@ class ProjectTab(QWidget):
         self._fetch_start_timer.stop()
         self._git_refresh_enabled = False
         self._git_status_pending = False
+        self._git_file_timer.stop()
         for pane in self._file_panes.values():
             pane.stop_workers()
         self.indexer.stop()
@@ -2624,6 +2807,7 @@ class ProjectTab(QWidget):
 
     def open_file_picker(self) -> None:
         """Ctrl+Shift+N：弹独立浮窗按文件名搜（IDEA 风格），回车在中心区打开"""
+        usage_stats.record_gui("shortcut:quick_open")
         from src.ui.quick_open import show_file_picker
         started = time.perf_counter()
         dlg = show_file_picker(
@@ -2639,11 +2823,12 @@ class ProjectTab(QWidget):
 
     def open_content_search(self) -> None:
         """Ctrl+Shift+F：在当前项目内搜索文件内容。"""
+        usage_stats.record_gui("shortcut:content_search")
         started = time.perf_counter()
         dlg = ContentSearchDialog(
             self.project_meta.path, parent=self, indexer=self.indexer,
         )
-        dlg.open_requested.connect(lambda p, l, c: self._show_preview(p, l, c))
+        dlg.open_requested.connect(lambda path, line, column: self._show_preview(path, line, column + 1))
         dlg.show()
         perf_log.info(
             "perf op=content-search-open duration_ms=%.1f files=%d status=done",
@@ -2651,6 +2836,7 @@ class ProjectTab(QWidget):
         )
 
     def open_recent_files(self) -> None:
+        usage_stats.record_gui("shortcut:recent_files")
         if not self._recent_files:
             QMessageBox.information(self, "最近打开", "还没有打开过文件")
             return
@@ -2667,48 +2853,31 @@ class ProjectTab(QWidget):
         懒加载：首次调用才后台扫描全项目 Controller，扫完自动刷新候选列表。
         项目里没有 .java 时直接提示，不弹空浮窗。
         """
-        from src.ui.quick_open import PickerDialog, PickerItem
-        from src.core.controller_index import ControllerIndexer
+        from src.ui.quick_open import show_component_picker
 
+        usage_stats.record_gui("shortcut:endpoint_picker")
         if self._controller_indexer is None:
             # 先粗检项目里有没有 java（用文件索引，零额外 IO）
             has_java = any(f.name.endswith(".java") for f in self.indexer.files())
             if not has_java and self.indexer.count() > 0:
                 QMessageBox.information(self, "接口跳转", "当前项目里没有找到 Java 文件。")
                 return
-            self._controller_indexer = ControllerIndexer(self.project_meta.path, self)
-            self._controller_indexer.build_async()
-
-        ci = self._controller_indexer
-        dlg = PickerDialog("按接口地址定位   (Ctrl+\\)", self)
-
-        def fetch(query: str) -> list[PickerItem]:
-            if not ci.is_built():
-                return []
-            return [
-                PickerItem(title=ep.display, subtitle=ep.subtitle,
-                           data=(ep.abs_path, ep.line_no))
-                for ep in ci.search(query, limit=150)
-            ]
-
-        dlg.set_fetcher(fetch)
-        dlg.picked.connect(lambda d: self._show_preview(d[0], d[1], 0))
-
-        if ci.is_built():
-            dlg.input.setPlaceholderText(f"已索引 {ci.count()} 个接口...")
-        else:
-            dlg.input.setPlaceholderText("正在扫描 Controller，请稍候...")
-            # 扫完后刷新当前浮窗（若还开着）
-            def on_ready(n: int):
-                if dlg.isVisible():
-                    dlg.input.setPlaceholderText(f"已索引 {n} 个接口...")
-                    dlg._refresh(dlg.input.text())
-            ci.ready.connect(on_ready)
-
-        self._endpoint_dialog = dlg
+        dlg = show_component_picker(
+            [("", self.controller_indexer())],
+            lambda picked: self._show_preview(picked[1], picked[2], 0),
+            endpoints=True, parent=self,
+        )
         dlg.show()
 
+    def controller_indexer(self):
+        from src.core.controller_index import ControllerIndexer
+
+        if self._controller_indexer is None:
+            self._controller_indexer = ControllerIndexer(self.project_meta.path, self)
+        self._controller_indexer.build_async()
+        return self._controller_indexer
     def open_git_viewer(self) -> None:
+        usage_stats.record_gui("git:open_viewer", ok=self._is_git_repo)
         if not self._is_git_repo:
             QMessageBox.information(self, "Git", "当前项目不是 git 仓库")
             return
@@ -2724,16 +2893,4 @@ class ProjectTab(QWidget):
         dlg.statusUpdated.connect(self._on_git_snapshot_ready)
         dlg.destroyed.connect(lambda: setattr(self, "_git_viewer", None))
         dlg.openFileRequested.connect(lambda p: self._show_preview(p, 0, 0))
-        dlg.show()
-
-    def open_project_info(self) -> None:
-        """项目信息弹窗（路径/类型/包管理/主类，只读）"""
-        from PySide6.QtWidgets import QDialog, QVBoxLayout
-        dlg = QDialog(self)
-        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        dlg.setWindowTitle(f"ℹ️ 项目信息 — {self.project_meta.name}")
-        dlg.resize(440, 280)
-        lay = QVBoxLayout(dlg)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(SettingsPanel(self.project_meta, self.entry, parent=dlg))
         dlg.show()

@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from src.ui.main_window import MainWindow
 
 from src.core import git_context
-from src.core.cli_contract import is_path_target, result_code
+from src.core.cli_contract import COMMANDS, is_path_target, result_code
 from src.core.aggregate_workspace import (
     load_aggregate_project, load_development_workspace,
 )
@@ -31,10 +31,11 @@ from src.core.development_workspace_service import (
     sync_development_workspace, sync_commit_and_push_development_workspace,
 )
 from src.core.path_utils import normalized_path_key
-from src.core.service_state import EnvironmentSwitchBlocked
+from src.core.service_state import EnvironmentSwitchBlocked, KIND_MODULE, KIND_PROJECT
 from src.core.target_resolver import (
     TargetResolutionError, resolve_target_path,
 )
+from src.core.usage_stats import short_target, usage_stats
 from src.util import app_log
 from src.core.app_version import build_info
 
@@ -56,10 +57,25 @@ def _connected(sock):
         return False
 
 
+def _record_cli_result(channel, result) -> None:
+    usage = getattr(channel, "_cli_usage", None)
+    if usage is None:
+        return
+    channel._cli_usage = None
+    command, target, started = usage
+    ok = not isinstance(result, dict) or result.get("ok") is not False
+    usage_stats.record_cli(
+        command, target=target, ok=ok,
+        duration_ms=(time.perf_counter() - started) * 1000, error_code=result_code(result),
+    )
+
+
 class _OperationChannel(QObject):
     def __init__(self, window, sock, command, receipt):
         super().__init__(window)
         self.sock = sock
+        self._cli_usage = getattr(sock, "_cli_usage", None)
+        sock._cli_usage = None
         self.store = _operations(window)
         self.identifier = receipt["operation_id"]
         self.answered = bool(command.get("async"))
@@ -98,6 +114,7 @@ class _OperationChannel(QObject):
         if result.get("ok") is False:
             result.setdefault("code", result_code(result))
         record = self.store.complete(self.identifier, result)
+        _record_cli_result(self, result)
         if not self.answered and _connected(self.sock):
             _send_response(self.sock, {**result, "operation_status": record["status"]})
         self.deleteLater()
@@ -111,6 +128,7 @@ def _cmd_operation_async(window, identifier, wait_seconds, sock, return_result=F
 
     def check():
         if not _connected(sock):
+            _record_cli_result(sock, {"ok": False, "code": "client_disconnected"})
             timer.stop()
             timer.deleteLater()
             return
@@ -139,43 +157,111 @@ def _cmd_operation_async(window, identifier, wait_seconds, sock, return_result=F
 class _InspectionWorker(QObject):
     done = Signal(dict)
 
-    def __init__(self, command, aggregates, observations):
+    def __init__(self, command, aggregates, observations, known_projects=()):
         super().__init__()
         self.command, self.aggregates, self.observations = command, aggregates, observations
+        self.known_projects = known_projects
 
     @Slot()
     def run(self):
-        from src.core.project_inspection import inspect_directory
         try:
-            command = self.command
-            context = inspect_directory(command.get("path") or command["project"], self.aggregates,
-                                        self.observations, command.get("full", False))
-            if command["cmd"] == "list-actions":
-                result = {"ok": True, "projects": [{"path": item["path"], "actions": item["actions"]} for item in context["projects"]]}
-            elif command["cmd"] == "list-runtimes":
-                result = []
-                for project in context["projects"]:
-                    states = {state["name"]: state for state in project["states"]}
-                    for unit in project["runtime_units"]:
-                        result.append({**unit, "observed": project["observed"],
-                            "state": states.get(unit["id"], {"detail_state": "unknown", "reason": "project is not open; not observed"})})
-            else:
-                result = context
+            result = self._snapshot() if self.command["cmd"] == "snapshot" else self._inspect()
         except Exception as exc:
             result = {"ok": False, "code": "inspection_failed", "error": str(exc)}
         self.done.emit({"_inspection_payload": result})
 
+    def _inspect(self):
+        from src.core.project_inspection import inspect_directory
+
+        command = self.command
+        context = inspect_directory(command.get("path") or command["project"], self.aggregates,
+                                    self.observations, command.get("full", False))
+        if command["cmd"] == "list-actions":
+            return {"ok": True, "projects": [{"path": item["path"], "actions": item["actions"]} for item in context["projects"]]}
+        if command["cmd"] == "list-runtimes":
+            result = []
+            for project in context["projects"]:
+                states = {state["name"]: state for state in project["states"]}
+                for unit in project["runtime_units"]:
+                    result.append({**unit, "observed": project["observed"],
+                        "state": states.get(unit["id"], {"detail_state": "unknown", "reason": "project is not open; not observed"})})
+            return result
+        return context
+
+    def _snapshot(self):
+        from src.core.project_inspection import capture_snapshot
+
+        target = self.command.get("target", "")
+        if not is_path_target(target):
+            records = [*self.known_projects, *self.observations]
+            aggregates = _registered_aggregate_records(self.aggregates)
+            for record in aggregates:
+                aggregate = record["project"]
+                records.append(record)
+                records.extend({"id": component.id, "name": component.name,
+                                "path": str(component.absolute_path(aggregate.root_path))}
+                               for component in aggregate.components)
+            records.extend(_registered_workspace_records(aggregates))
+            unique = {}
+            for record in records:
+                key = normalized_path_key(record["path"])
+                candidate = unique.setdefault(key, _public_target_candidate(record))
+                aliases = candidate.setdefault("aliases", set())
+                aliases.update(value for value in (record["id"], record["name"]) if value)
+            found, error = _match_target(list(unique.values()), target, "target")
+            if error:
+                return error
+            target = found["path"]
+        resolved = resolve_target_path(target, self.aggregates)
+        return capture_snapshot(
+            resolved, self.observations, usage_stats.snapshot()["recent_ai_events"][-5:],
+            tail=self.command.get("tail", 60), max_chars=self.command.get("max_chars", 12000),
+        )
+
+
+def _snapshot_observations(window):
+    observations = []
+    for tab in _project_target_tabs(window):
+        meta = tab.project_meta
+        controller = tab.service_controller
+        units = tuple(meta.runtime_units)
+        states = {}
+        for state in controller.states(refresh_external=False):
+            if state.kind == KIND_MODULE:
+                states[state.module] = state
+            elif state.kind == KIND_PROJECT and len(units) == 1:
+                states[units[0].id] = state
+        launches = {}
+        for unit in units:
+            launch = controller._launches.state(unit.id)
+            if launch is not None:
+                launches[unit.id] = (launch.generation, launch.output.snapshot())
+        observations.append({
+            "id": getattr(tab, "component_id", "") or Path(meta.path).name,
+            "name": meta.name, "path": meta.path, "units": units,
+            "default_port": meta.default_port, "health_path": meta.health_check_path,
+            "states": states, "launches": launches,
+        })
+    return observations
+
 
 def _run_inspection_async(command, window, sock):
-    observations = {str(Path(tab.project_meta.path).resolve()).casefold():
-                    [state.to_cli_module() for state in tab.service_controller.states(refresh_external=False)]
-                    for tab in _project_target_tabs(window)}
+    known_projects = ()
+    if command["cmd"] == "snapshot":
+        observations = _snapshot_observations(window)
+        known_projects = tuple({"id": Path(entry.path).name, "name": entry.name, "path": entry.path}
+                               for entry in window.config.recent_projects)
+    else:
+        observations = {str(Path(tab.project_meta.path).resolve()).casefold():
+                        [state.to_cli_module() for state in tab.service_controller.states(refresh_external=False)]
+                        for tab in _project_target_tabs(window)}
     thread = BackgroundThread()
-    worker = _InspectionWorker(dict(command), tuple(window.config.aggregate_project_paths), observations)
+    worker = _InspectionWorker(
+        dict(command), tuple(window.config.aggregate_project_paths), observations, known_projects,
+    )
     responder = _GitDiffResponder(sock, thread, worker)
     worker.moveToThread(thread)
     worker.done.connect(responder.receive, Qt.ConnectionType.QueuedConnection)
-    worker.done.connect(thread.quit)
     thread.started.connect(worker.run)
     thread.finished.connect(worker.deleteLater)
     thread.finished.connect(responder.cleanup)
@@ -303,6 +389,7 @@ def _match_target(records: list[dict], target: str, label: str) -> tuple[dict | 
             str(item.get("id", "")).casefold(),
             str(item.get("name", "")).casefold(),
             Path(item["path"]).name.casefold(),
+            *(alias.casefold() for alias in item.get("aliases", ())),
         }
     ]
     if len(exact) == 1:
@@ -318,6 +405,7 @@ def _match_target(records: list[dict], target: str, label: str) -> tuple[dict | 
         item for item in records
         if any(folded in str(value).casefold() for value in (
             item.get("id", ""), item.get("name", ""), item.get("path", ""),
+            *item.get("aliases", ()),
         ))
     ]
     if len(fuzzy) == 1:
@@ -436,6 +524,41 @@ class _GitDiffWorker(QObject):
         self.deleteLater()
 
 
+def _registered_aggregate_records(paths) -> list[dict]:
+    records = []
+    for path in paths:
+        try:
+            project = load_aggregate_project(path)
+        except Exception:
+            continue
+        records.append({"id": project.id, "name": project.name,
+                        "path": project.root_path, "project": project})
+    return records
+
+
+def _registered_workspace_records(aggregates) -> list[dict]:
+    records = []
+    for aggregate in aggregates:
+        project = aggregate["project"]
+        root = project.workspace_root
+        if not root.is_dir():
+            continue
+        try:
+            children = tuple(root.iterdir())
+        except OSError:
+            continue
+        for path in children:
+            if not path.is_dir() or not (path / "workspace.json").is_file():
+                continue
+            try:
+                workspace = load_development_workspace(path, aggregate_project=project)
+            except Exception:
+                continue
+            records.append({"id": workspace.id, "name": workspace.name, "path": workspace.root_path,
+                            "workspace": workspace, "project": project})
+    return records
+
+
 class _WorkspaceCommandWorker(QObject):
     done = Signal(dict)
     progress = Signal(str)
@@ -447,42 +570,10 @@ class _WorkspaceCommandWorker(QObject):
         self.running_paths = running_paths
 
     def _aggregates(self) -> list[dict]:
-        records = []
-        for path in self.aggregate_paths:
-            try:
-                project = load_aggregate_project(path)
-                records.append({
-                    "id": project.id, "name": project.name,
-                    "path": project.root_path, "project": project,
-                })
-            except Exception:
-                continue
-        return records
+        return _registered_aggregate_records(self.aggregate_paths)
 
     def _workspaces(self) -> list[dict]:
-        records = []
-        for aggregate in self._aggregates():
-            project = aggregate["project"]
-            root = project.workspace_root
-            if not root.is_dir():
-                continue
-            try:
-                children = tuple(root.iterdir())
-            except OSError:
-                continue
-            for path in children:
-                if not path.is_dir() or not (path / "workspace.json").is_file():
-                    continue
-                try:
-                    workspace = load_development_workspace(path, aggregate_project=project)
-                except Exception:
-                    continue
-                records.append({
-                    "id": workspace.id, "name": workspace.name,
-                    "path": workspace.root_path, "workspace": workspace,
-                    "project": project,
-                })
-        return records
+        return _registered_workspace_records(self._aggregates())
 
     @Slot()
     def run(self) -> None:
@@ -752,9 +843,10 @@ class _GitDiffResponder(QObject):
 
     @Slot(dict)
     def finish(self, payload: dict) -> None:
-        if self.sock.state() == QLocalSocket.LocalSocketState.ConnectedState:
+        try:
             _send_response(self.sock, payload)
-        self.thread.quit()
+        finally:
+            self.thread.quit()
 
     @Slot()
     def cleanup(self) -> None:
@@ -872,18 +964,23 @@ def handle_cli_request(data: str, sock: QLocalSocket, window: "MainWindow") -> b
     except json.JSONDecodeError:
         return False
 
-    if "cmd" not in cmd:
+    if not isinstance(cmd, dict) or "cmd" not in cmd:
         return False
 
-    log.info("[CLI] %s params=%s", cmd.get("cmd", "?"), {k: v for k, v in cmd.items() if k != "cmd"})
-
-    if getattr(window, "_shutdown_in_progress", False) and cmd.get("cmd") not in (
-        "status", "preflight-build", "quit",
-    ):
-        _send_response(sock, {"ok": False, "error": "IDE is preparing to quit"})
+    action = cmd["cmd"]
+    if not isinstance(action, str) or action not in COMMANDS:
+        _send_response(sock, {"ok": False, "code": "invalid_arguments", "error": "unknown command"})
         return True
+    target_fields = {"project", "path", "target", "aggregate"}
+    target = next((short_target(cmd.get(field.rstrip("?"), ""))
+                   for field in COMMANDS[action]["positional"] if field.rstrip("?") in target_fields), "")
+    target = short_target(cmd.get("module", "")) or target
+    sock._cli_usage = (action, target, time.perf_counter())
 
     try:
+        if handle_async_cli_request(cmd, sock, window):
+            return True
+        log.info("[CLI] %s params=%s", action, {k: v for k, v in cmd.items() if k != "cmd"})
         result = _dispatch(cmd, window)
     except EnvironmentSwitchBlocked as exc:
         result = exc.result
@@ -907,6 +1004,9 @@ def _send_response(sock: QLocalSocket, result: dict) -> None:
     if isinstance(sock, _OperationChannel):
         sock.finish(result)
         return
+    _record_cli_result(sock, result)
+    if not _connected(sock):
+        return
     if isinstance(result, dict) and result.get("ok") is False:
         result.setdefault("code", result_code(result))
     payload = json.dumps(result, ensure_ascii=False) + "\n"
@@ -921,6 +1021,9 @@ def _dispatch(cmd: dict, window: "MainWindow") -> dict:
 
     if action == "status":
         return _cmd_status(window)
+
+    if action == "usage-stats":
+        return {"ok": True, **usage_stats.snapshot()}
 
     if action == "list-projects":
         return _cmd_list_projects(window)
@@ -1009,6 +1112,11 @@ def handle_async_cli_request(
     cmd: dict, sock: QLocalSocket, window: "MainWindow"
 ) -> bool:
     from src.core.cli_contract import TRACKED_COMMANDS
+    if getattr(window, "_shutdown_in_progress", False) and cmd.get("cmd") not in (
+        "status", "usage-stats", "preflight-build", "quit",
+    ):
+        _send_response(sock, {"ok": False, "error": "IDE is preparing to quit"})
+        return True
     if cmd.get("cmd") == "operation":
         _cmd_operation_async(window, cmd["operation_id"], cmd.get("wait_seconds", 0), sock)
         return True
@@ -1019,6 +1127,7 @@ def handle_async_cli_request(
             _send_response(sock, {"ok": False, "code": "operation_request_conflict", "error": str(exc)})
             return True
         if not created:
+            sock._cli_usage = None
             if cmd.get("async"):
                 _send_response(sock, {"ok": True, "accepted": receipt["status"] == "running", "operation_id": receipt["operation_id"], "operation": receipt})
             else:
@@ -1036,15 +1145,10 @@ def handle_async_cli_request(
 def _handle_async_cli_request(cmd, sock, window) -> bool:
     """处理需要异步等待的命令。返回 True 表示已接管。"""
     action = cmd.get("cmd")
-    if getattr(window, "_shutdown_in_progress", False) and action not in (
-        "status", "preflight-build", "quit",
-    ):
-        _send_response(sock, {"ok": False, "error": "IDE is preparing to quit"})
-        return True
     if action == "quit":
         _cmd_quit_async(window, sock)
         return True
-    if action == "context":
+    if action in ("context", "snapshot"):
         _run_inspection_async(cmd, window, sock)
         return True
     if action in ("list-actions", "list-runtimes"):
@@ -1388,11 +1492,7 @@ def _cmd_quit_async(window: "MainWindow", sock: QLocalSocket) -> None:
 
     def complete(result: dict) -> None:
         log.info("[CLI] quit %s", "ok" if result.get("ok") else result.get("error", "fail"))
-        try:
-            if sock.state() == QLocalSocket.LocalSocketState.ConnectedState:
-                _send_response(sock, result)
-        except RuntimeError:
-            pass
+        _send_response(sock, result)
         if result.get("ok"):
             QTimer.singleShot(300, window.finish_application_quit)
 
@@ -1688,7 +1788,8 @@ def _cmd_health_async(
     def _check():
         now = time.time()
         # 客户端已断开就别再空转 / 往死 socket 写
-        if sock.state() != QLocalSocket.LocalSocketState.ConnectedState:
+        if not _connected(sock):
+            _record_cli_result(sock, {"ok": False, "code": "client_disconnected"})
             timer.stop()
             timer.deleteLater()
             return
@@ -1868,8 +1969,7 @@ def _cmd_compile_async(tab, sock: QLocalSocket, timeout: int = 300, action: str 
             runner.outputLine.disconnect(_on_output)
         except (RuntimeError, TypeError):
             pass
-        if sock.state() == QLocalSocket.LocalSocketState.ConnectedState:
-            _send_response(sock, payload)
+        _send_response(sock, payload)
 
     def _on_finished(exit_code: int):
         output = _collect_output()

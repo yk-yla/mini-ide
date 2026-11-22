@@ -14,7 +14,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QHBoxLayout,
     QHeaderView, QLabel, QMessageBox, QPushButton, QSplitter, QStackedWidget,
-    QStyle, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem,
+    QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget, QFrame, QScrollArea, QSizePolicy,
 )
 
@@ -36,12 +36,16 @@ from src.core.service_state import (
 from src.core.tool_launchers import (
     CREATE_NO_WINDOW, open_in_cc_args, open_in_codex_args,
 )
+from src.core.usage_stats import usage_stats
 from src.ui.aggregate_project_dialog import AggregateProjectDialog
 from src.ui.development_workspace_dialog import DevelopmentWorkspaceDialog
+from src.ui.icons import icon, project_icon_name
 from src.ui.project_tab import ProjectTab
+from src.ui.quick_open import show_component_picker
+from src.ui.content_search import ContentSearchDialog
 from src.ui.theme import (
-    COLOR_ERROR, COLOR_SUCCESS, COLOR_WARN, FG_DIM, GAP_LG, GAP_MD, GAP_NONE,
-    GAP_SM,
+    COLOR_ERROR, COLOR_LINK, COLOR_SUCCESS, COLOR_WARN, FG_DIM, GAP_LG, GAP_MD, GAP_NONE,
+    GAP_SM, GAP_XS,
 )
 
 action_log = logging.getLogger("mini-ide.action")
@@ -136,8 +140,8 @@ class _WorkspaceCard(QFrame):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 14)
-        root.setSpacing(8)
+        root.setContentsMargins(GAP_MD, GAP_MD, GAP_MD, GAP_MD)
+        root.setSpacing(GAP_SM)
 
         head = QHBoxLayout()
         head.setSpacing(8)
@@ -186,10 +190,7 @@ class _WorkspaceCard(QFrame):
         branch_label.setObjectName("workspace_card_label")
         branch_label.setFixedWidth(64)
         branch_row.addWidget(branch_label)
-        branch = QLabel(
-            f'<a href="branches">{len(summary.task_branches)} 个任务分支 · 点击查看</a>'
-            if summary.task_branches else "无任务分支"
-        )
+        branch = self.branch_link = QLabel()
         branch.setObjectName("workspace_branch_link")
         branch.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
         branch.linkActivated.connect(lambda _link: self._show_branches())
@@ -205,6 +206,14 @@ class _WorkspaceCard(QFrame):
         actions.addStretch(1)
         self._add_button(actions, "进入工作区", "activate", primary=True)
         root.addLayout(actions)
+        self.refresh_theme()
+
+    def refresh_theme(self) -> None:
+        self.branch_link.setText(
+            f'<a href="branches" style="color:{COLOR_LINK}; text-decoration:none;">'
+            f'{len(self.summary.task_branches)} 个任务分支 · 点击查看</a>'
+            if self.summary.task_branches else "无任务分支"
+        )
 
     def _add_status(self, layout, text: str, tone: str) -> None:
         status = QLabel(text)
@@ -241,6 +250,23 @@ class _WorkspaceCard(QFrame):
     def mouseDoubleClickEvent(self, event) -> None:
         self.activated.emit(self.summary)
         super().mouseDoubleClickEvent(event)
+
+
+class _ProjectStatusDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        color = index.data(Qt.ItemDataRole.ForegroundRole)
+        if color is None or not option.state & QStyle.StateFlag.State_Selected:
+            super().paint(painter, option, index)
+            return
+        item = QStyleOptionViewItem(option)
+        self.initStyleOption(item, index)
+        text, item.text = item.text, ""
+        option.widget.style().drawControl(QStyle.ControlElement.CE_ItemViewItem, item, painter, option.widget)
+        painter.save()
+        painter.setFont(item.font)
+        painter.setPen(color.color())
+        painter.drawText(item.rect.adjusted(GAP_SM, 0, -GAP_SM, 0), item.displayAlignment, text)
+        painter.restore()
 
 
 class AggregateProjectTab(QWidget):
@@ -297,8 +323,8 @@ class AggregateProjectTab(QWidget):
         self._create_poll_timer.timeout.connect(self._poll_workspace_creation)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(GAP_MD, GAP_MD, GAP_MD, GAP_MD)
-        root.setSpacing(GAP_SM)
+        root.setContentsMargins(GAP_SM, GAP_XS, GAP_SM, GAP_SM)
+        root.setSpacing(GAP_XS)
 
         header = QHBoxLayout()
         header.setSpacing(GAP_SM)
@@ -309,9 +335,7 @@ class AggregateProjectTab(QWidget):
         self.context_label.setProperty("role", "subtitle")
         header.addWidget(self.context_label)
         self.exit_workspace_button = QPushButton("退出工作区")
-        self.exit_workspace_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack)
-        )
+        self.exit_workspace_button.setProperty("compact", True)
         self.exit_workspace_button.setToolTip("退出当前需求工作区，返回聚合目录")
         self.exit_workspace_button.clicked.connect(
             lambda: self.activate_workspace(None)
@@ -319,6 +343,7 @@ class AggregateProjectTab(QWidget):
         header.addWidget(self.exit_workspace_button)
         header.addStretch(1)
         self.edit_button = QPushButton("编辑项目列表")
+        self.edit_button.setProperty("compact", True)
         self.edit_button.clicked.connect(self.edit_project_definition)
         header.addWidget(self.edit_button)
         root.addLayout(header)
@@ -330,6 +355,11 @@ class AggregateProjectTab(QWidget):
         self.workspaces_page = self._build_workspaces_page()
         self.view_tabs.addTab(self.projects_page, "项目")
         self.view_tabs.addTab(self.workspaces_page, "需求工作区")
+        self._build_project_tools()
+        self.view_tabs.currentChanged.connect(
+            lambda index: self._project_tools.setVisible(self.view_tabs.widget(index) is self.projects_page)
+        )
+        self.refresh_theme()
         root.addWidget(self.view_tabs, 1)
 
         self._set_context_label()
@@ -340,29 +370,33 @@ class AggregateProjectTab(QWidget):
         self._refresh_timer.timeout.connect(self.refresh_project_states)
         self._refresh_timer.start()
 
+    def _build_project_tools(self) -> None:
+        self._project_tools = QWidget()
+        tools = QHBoxLayout(self._project_tools)
+        tools.setContentsMargins(GAP_SM, GAP_NONE, GAP_XS, GAP_XS)
+        tools.setSpacing(GAP_SM)
+        self.project_progress = QLabel("正在识别项目...")
+        self.project_progress.setProperty("role", "hint")
+        tools.addWidget(self.project_progress)
+        self.project_codex_button = QPushButton("codex")
+        self.project_codex_button.setObjectName("external_tool_button")
+        self.project_codex_button.setProperty("compact", True)
+        self.project_codex_button.setToolTip("使用 open gpt 打开当前代码环境")
+        self.project_codex_button.clicked.connect(self._open_current_in_codex)
+        tools.addWidget(self.project_codex_button)
+        self.project_cc_button = QPushButton("cc")
+        self.project_cc_button.setObjectName("external_tool_button")
+        self.project_cc_button.setProperty("compact", True)
+        self.project_cc_button.setToolTip("在 AgentDesk 中打开当前代码环境")
+        self.project_cc_button.clicked.connect(self._open_current_in_cc)
+        tools.addWidget(self.project_cc_button)
+        self.view_tabs.setCornerWidget(self._project_tools, Qt.Corner.TopRightCorner)
+
     def _build_projects_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(GAP_NONE, GAP_SM, GAP_NONE, GAP_NONE)
-        layout.setSpacing(GAP_SM)
-        self.project_progress = QLabel("正在识别项目...")
-        self.project_progress.setProperty("role", "hint")
-        progress_row = QHBoxLayout()
-        progress_row.setSpacing(GAP_SM)
-        progress_row.addWidget(self.project_progress, 1)
-        self.project_codex_button = QPushButton("codex")
-        self.project_codex_button.setObjectName("external_tool_button")
-        self.project_codex_button.setMinimumWidth(58)
-        self.project_codex_button.setToolTip("使用 open gpt 打开当前代码环境")
-        self.project_codex_button.clicked.connect(self._open_current_in_codex)
-        progress_row.addWidget(self.project_codex_button)
-        self.project_cc_button = QPushButton("cc")
-        self.project_cc_button.setObjectName("external_tool_button")
-        self.project_cc_button.setMinimumWidth(42)
-        self.project_cc_button.setToolTip("在 AgentDesk 中打开当前代码环境")
-        self.project_cc_button.clicked.connect(self._open_current_in_cc)
-        progress_row.addWidget(self.project_cc_button)
-        layout.addLayout(progress_row)
+        layout.setContentsMargins(GAP_NONE, GAP_XS, GAP_NONE, GAP_NONE)
+        layout.setSpacing(GAP_XS)
 
         self.project_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.project_splitter.setChildrenCollapsible(False)
@@ -373,7 +407,7 @@ class AggregateProjectTab(QWidget):
         sidebar.setMinimumWidth(220)
         sidebar.setMaximumWidth(300)
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(GAP_MD, GAP_MD, GAP_MD, GAP_MD)
+        sidebar_layout.setContentsMargins(GAP_SM, GAP_SM, GAP_SM, GAP_SM)
         sidebar_layout.setSpacing(GAP_SM)
         self.project_tree_label = QLabel("项目")
         self.project_tree_label.setProperty("role", "title")
@@ -381,6 +415,7 @@ class AggregateProjectTab(QWidget):
         self.project_tree = QTreeWidget()
         self.project_tree.setObjectName("aggregate_project_tree")
         self.project_tree.setColumnCount(2)
+        self.project_tree.setItemDelegateForColumn(1, _ProjectStatusDelegate(self.project_tree))
         self.project_tree.setHeaderHidden(True)
         self.project_tree.setRootIsDecorated(False)
         self.project_tree.setUniformRowHeights(True)
@@ -440,9 +475,7 @@ class AggregateProjectTab(QWidget):
         actions.addWidget(self.new_workspace_button)
         actions.addStretch(1)
         self.refresh_workspace_button = QToolButton()
-        self.refresh_workspace_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
-        )
+        self.refresh_workspace_button.setAccessibleName("刷新需求工作区")
         self.refresh_workspace_button.setToolTip("刷新需求工作区")
         self.refresh_workspace_button.clicked.connect(self.refresh_workspaces)
         actions.addWidget(self.refresh_workspace_button)
@@ -570,6 +603,8 @@ class AggregateProjectTab(QWidget):
             self._pending_component_id = ""
         elif self.project_tree.topLevelItemCount() and not self.project_tree.selectedItems():
             self.project_tree.setCurrentItem(self.project_tree.topLevelItem(0))
+        for tab in self._project_tabs.values():
+            tab.cockpit.refresh_events()
         self.refresh_project_states()
 
     def _install_project(self, item: dict, existing: ProjectTab | None = None) -> None:
@@ -578,7 +613,7 @@ class AggregateProjectTab(QWidget):
         meta = item.get("meta")
         node = QTreeWidgetItem([
             item.get("name") or project_id,
-            "配置错误" if item.get("error") else "已停止",
+            "错误" if item.get("error") else "",
         ])
         node.setData(0, Qt.ItemDataRole.UserRole, project_id)
         node.setToolTip(0, item.get("error", "") or (
@@ -587,6 +622,7 @@ class AggregateProjectTab(QWidget):
         ))
         self.project_tree.addTopLevelItem(node)
         self._project_nodes[project_id] = node
+        self._refresh_project_icon(project_id, node)
         if meta is None:
             return
         runtime_count = len(meta.runtime_units)
@@ -604,6 +640,7 @@ class AggregateProjectTab(QWidget):
             tab = ProjectTab(meta, entry, self.config)
             tab.path = item["path"]
         tab.component_id = project_id
+        tab.navigation_host = self
         self._project_tabs[project_id] = tab
         self.detail_stack.addWidget(tab)
 
@@ -652,7 +689,21 @@ class AggregateProjectTab(QWidget):
         self.view_tabs.setCurrentWidget(self.workspaces_page)
 
     def refresh_theme(self) -> None:
+        self.exit_workspace_button.setIcon(icon("arrow_left"))
+        self.edit_button.setIcon(icon("edit"))
+        self.project_codex_button.setIcon(icon("external_link"))
+        self.project_cc_button.setIcon(icon("external_link"))
+        self.refresh_workspace_button.setIcon(icon("refresh"))
+        for project_id, node in self._project_nodes.items():
+            self._refresh_project_icon(project_id, node)
         self.refresh_project_states()
+
+    def _refresh_project_icon(self, project_id: str, node: QTreeWidgetItem) -> None:
+        item = self._metadata[project_id]
+        meta = item.get("meta")
+        node.setIcon(0, icon(project_icon_name(meta.project_type) if meta else "folder"))
+        if item.get("error"):
+            node.setForeground(1, QColor(str(COLOR_ERROR)))
 
     def tab_title(self) -> str:
         """顶层 Tab 标题；工作区模式带上需求名，避免误以为在源目录。"""
@@ -675,6 +726,16 @@ class AggregateProjectTab(QWidget):
 
     def activate_workspace(
         self, workspace: DevelopmentWorkspace | None, *, interactive: bool = True,
+    ) -> bool:
+        started = time.perf_counter()
+        entered = self._activate_workspace(workspace, interactive=interactive)
+        if interactive and workspace is not None:
+            usage_stats.record_gui("workspace:enter", ok=entered,
+                                   duration_ms=(time.perf_counter() - started) * 1000)
+        return entered
+
+    def _activate_workspace(
+        self, workspace: DevelopmentWorkspace | None, *, interactive: bool,
     ) -> bool:
         old_path = self.workspace.root_path if self.workspace else ""
         new_path = workspace.root_path if workspace else ""
@@ -859,6 +920,8 @@ class AggregateProjectTab(QWidget):
     def _workspace_created(self, result) -> None:
         self._create_worker = None
         self._create_poll_timer.stop()
+        usage_stats.record_gui("workspace:create", ok=result.ok and result.workspace is not None,
+                               duration_ms=(time.monotonic() - self._create_started) * 1000)
         if not result.ok or result.workspace is None:
             action_log.warning("[GUI] 创建工作区失败 error=%s", result.error)
             details = [result.error]
@@ -888,8 +951,9 @@ class AggregateProjectTab(QWidget):
             else self.aggregate_project.root_path
         )
 
-    def _open_external_tool(self, target: Path, command: list[str], tool_name: str = "AgentDesk") -> None:
+    def _open_external_tool(self, target: Path, command: list[str], action: str, tool_name: str) -> None:
         if not command:
+            usage_stats.record_gui(action, ok=False)
             QMessageBox.warning(
                 self, "启动 AgentDesk 失败",
                 "没有找到 AgentDesk，请先安装或配置 AGENTDESK_EXE。",
@@ -900,15 +964,18 @@ class AggregateProjectTab(QWidget):
                 command, cwd=str(target), creationflags=CREATE_NO_WINDOW, close_fds=True,
             )
         except OSError as exc:
+            usage_stats.record_gui(action, ok=False)
             QMessageBox.warning(self, f"启动 {tool_name} 失败", str(exc))
+        else:
+            usage_stats.record_gui(action)
 
     def _open_current_in_codex(self) -> None:
         target = self._current_environment_root()
-        self._open_external_tool(target, open_in_codex_args(target), "open gpt")
+        self._open_external_tool(target, open_in_codex_args(target), "external:codex", "open gpt")
 
     def _open_current_in_cc(self) -> None:
         target = self._current_environment_root()
-        self._open_external_tool(target, open_in_cc_args(target))
+        self._open_external_tool(target, open_in_cc_args(target), "external:cc", "AgentDesk")
 
     def edit_project_definition(self) -> None:
         if self._save_worker or self._prepare_worker:
@@ -973,44 +1040,55 @@ class AggregateProjectTab(QWidget):
     def start_component(self, component_id: str) -> dict:
         tab = self._project_tabs.get(component_id)
         if tab is None:
+            usage_stats.record_gui("service:start", ok=False)
             return {"ok": False, "error": f"project not available: {component_id}"}
         states = [item for item in tab.service_states(refresh_external=True) if item.kind != "script"]
         if states and all(item.is_running for item in states):
+            usage_stats.record_gui("service:start")
             return {"ok": True, "already_running": True}
-        result = tab.service_controller.request("start", on_done=lambda _result: self.refresh_project_states())
-        self.refresh_project_states()
-        return result
+        return self._request_service(tab, "start", None)
 
     def start_runtime(self, component_id: str, runtime_id: str | None) -> dict:
         if runtime_id is None:
             return self.start_component(component_id)
         tab = self._project_tabs.get(component_id)
         if tab is None:
+            usage_stats.record_gui("service:start", ok=False)
             return {"ok": False, "error": f"project not available: {component_id}"}
-        result = tab.service_controller.request("start", runtime_id, lambda _result: self.refresh_project_states())
-        self.refresh_project_states()
-        return result
+        return self._request_service(tab, "start", runtime_id)
 
     def stop_component(self, component_id: str) -> dict:
         tab = self._project_tabs.get(component_id)
         if tab is None:
+            usage_stats.record_gui("service:stop", ok=False)
             return {"ok": False, "error": f"project not available: {component_id}"}
         if not tab.running_service_items(refresh_external=True):
+            usage_stats.record_gui("service:stop")
             return {"ok": True, "already_stopped": True}
-        result = tab.service_controller.request("stop", on_done=lambda _result: self.refresh_project_states())
-        self.refresh_project_states()
-        return result
+        return self._request_service(tab, "stop", None)
 
     def stop_runtime(self, component_id: str, runtime_id: str | None) -> dict:
         if runtime_id is None:
             return self.stop_component(component_id)
         tab = self._project_tabs.get(component_id)
         if tab is None:
+            usage_stats.record_gui("service:stop", ok=False)
             return {"ok": False, "error": f"project not available: {component_id}"}
         states = tab.service_states(refresh_external=True)
         if not any(item.module == runtime_id and item.is_active for item in states):
+            usage_stats.record_gui("service:stop")
             return {"ok": True, "already_stopped": True}
-        result = tab.service_controller.request("stop", runtime_id, lambda _result: self.refresh_project_states())
+        return self._request_service(tab, "stop", runtime_id)
+
+    def _request_service(self, tab, action: str, runtime_id: str | None) -> dict:
+        started = time.perf_counter()
+
+        def completed(result):
+            usage_stats.record_gui(f"service:{action}", ok=bool(result.get("ok")),
+                                   duration_ms=(time.perf_counter() - started) * 1000)
+            self.refresh_project_states()
+
+        result = tab.service_controller.request(action, runtime_id, completed)
         self.refresh_project_states()
         return result
 
@@ -1032,19 +1110,15 @@ class AggregateProjectTab(QWidget):
                 item for item in states if item.state in (STATE_STARTING, STATE_STOPPING)
             ]
             running_count = sum(1 for item in states if item.is_running)
-            total = len(getattr(tab.project_meta, "runtime_units", ())) or len(states)
             if unknown:
-                status, color = "状态不确定", COLOR_ERROR
-            elif changing:
-                status, color = "处理中", COLOR_WARN
-            elif total and running_count == total and external:
-                status, color = "外部运行", COLOR_WARN
-            elif total and running_count == total:
-                status, color = "运行中", COLOR_SUCCESS
+                status, color = "错误", COLOR_ERROR
             elif running_count:
-                status, color = f"{running_count}/{total} 运行中", COLOR_SUCCESS
+                status = "● 运行" if running_count == 1 else f"● {running_count} 运行"
+                color = COLOR_WARN if len(external) == running_count else COLOR_SUCCESS
+            elif changing:
+                status, color = "● 处理中", COLOR_WARN
             else:
-                status, color = "已停止", FG_DIM
+                status, color = "", FG_DIM
             node.setText(1, status)
             node.setForeground(1, QColor(str(color)))
             node.setToolTip(1, "\n".join(item.reason for item in states if item.reason))
@@ -1125,14 +1199,39 @@ class AggregateProjectTab(QWidget):
         return tab if isinstance(tab, ProjectTab) else None
 
     def open_file_picker(self) -> None:
-        tab = self._current_project_tab()
-        if tab:
-            tab.open_file_picker()
+        usage_stats.record_gui("shortcut:quick_open")
+        sources = [(component, tab.indexer) for component, tab in self._project_tabs.items()]
+        if sources:
+            show_component_picker(sources, self._open_component_pick, parent=self).show()
 
     def open_content_search(self) -> None:
-        tab = self._current_project_tab()
-        if tab:
-            tab.open_content_search()
+        usage_stats.record_gui("shortcut:content_search")
+        roots = [(component, tab.path) for component, tab in self._project_tabs.items()]
+        if roots:
+            dialog = ContentSearchDialog(parent=self, roots=roots)
+            dialog.component_open_requested.connect(
+                lambda component, path, line, column: self._open_component_file(component, path, line, column + 1)
+            )
+            dialog.show()
+
+    def resolve_activity_log(self, source, target: str):
+        local_module = source.match_activity_log(target)
+        if local_module is not None:
+            return source, local_module
+        matches = []
+        for component, tab in self._project_tabs.items():
+            name = self._metadata[component].get("name") or component
+            module = tab.match_activity_log(target, (component, name))
+            if module is not None:
+                matches.append((tab, module))
+        return matches[0] if len(matches) == 1 else None
+
+    def open_activity_log(self, source, target: str) -> None:
+        destination = self.resolve_activity_log(source, target)
+        if destination is not None:
+            tab, module = destination
+            if self.select_component(tab.component_id):
+                tab.focus_activity_log(module)
 
     def open_recent_files(self) -> None:
         tab = self._current_project_tab()
@@ -1140,9 +1239,24 @@ class AggregateProjectTab(QWidget):
             tab.open_recent_files()
 
     def open_endpoint_picker(self) -> None:
-        tab = self._current_project_tab()
-        if tab:
-            tab.open_endpoint_picker()
+        usage_stats.record_gui("shortcut:endpoint_picker")
+        sources = [
+            (component, tab.controller_indexer()) for component, tab in self._project_tabs.items()
+            if tab.has_java_stack
+        ]
+        if sources:
+            show_component_picker(sources, self._open_component_pick, endpoints=True, parent=self).show()
+        else:
+            QMessageBox.information(self, "接口跳转", "当前聚合目录没有已加载的 Java 项目。")
+
+    def _open_component_pick(self, picked) -> None:
+        component, path, line = picked
+        self._open_component_file(component, path, line, 0)
+
+    def _open_component_file(self, component: str, path: str, line: int, column: int) -> None:
+        tab = self._project_tabs.get(component)
+        if tab is not None and Path(path).is_relative_to(tab.path) and self.select_component(component):
+            tab._show_preview(path, line, column)
 
     def restart_project(self) -> None:
         tab = self._current_project_tab()

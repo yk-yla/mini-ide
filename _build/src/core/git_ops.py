@@ -21,7 +21,6 @@ _POPEN_KW = {"creationflags": _NO_WINDOW} if _NO_WINDOW else {}
 _IGNORED_CACHE: dict[str, tuple[float, set[str]]] = {}
 _IGNORED_TTL = 10.0
 
-# 当前分支名的短缓存。状态栏每 3s 一轮都会问 current_branch，但分支只在切分支时变。
 _BRANCH_CACHE: dict[str, tuple[float, str]] = {}
 _BRANCH_TTL = 10.0
 
@@ -119,7 +118,7 @@ def read_status_snapshot(cwd: str) -> GitStatusSnapshot:
     started_ns = time.monotonic_ns()
     files = list_changed_files(cwd, strict=True)
     return GitStatusSnapshot(
-        started_ns, current_branch(cwd), files,
+        started_ns, current_branch(cwd, refresh=True), files,
         file_status_map(cwd, files=files), list_deleted_paths(cwd, files=files),
     )
 
@@ -287,15 +286,11 @@ def get_untracked_preview(cwd: str, path: str, max_lines: int = 200) -> str:
     return header + body
 
 
-def current_branch(cwd: str) -> str:
-    """当前分支名。带短缓存：状态栏每 3s 一轮都会问，但分支只在切分支时变。
-
-    不加缓存时每轮都会起一个 git 子进程，是刷新链路里仅次于 status 的开销来源。
-    切分支/fetch/merge 后由 _after_worktree_change() 主动失效。
-    """
+def current_branch(cwd: str, *, refresh: bool = False) -> str:
+    """读取当前分支。状态快照需要立即看到 IDE 外部的分支切换。"""
     now = time.time()
     cached = _BRANCH_CACHE.get(cwd)
-    if cached is not None and now - cached[0] < _BRANCH_TTL:
+    if not refresh and cached is not None and now - cached[0] < _BRANCH_TTL:
         return cached[1]
     rc, out, _ = _run(["rev-parse", "--abbrev-ref", "HEAD"], cwd, timeout=3)
     branch = out.strip() if rc == 0 else ""

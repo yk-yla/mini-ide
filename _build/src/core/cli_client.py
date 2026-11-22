@@ -192,7 +192,7 @@ def _response_timeout_ms(cmd: dict) -> int:
         }
         timeout = int(cmd.get("timeout", defaults.get(action, 120)))
         return (timeout + 5) * 1000
-    if action in ("git-diff", "git-ai-context"):
+    if action in ("git-diff", "git-ai-context", "snapshot"):
         return 120000
     return 30000
 

@@ -160,10 +160,12 @@ class GitStatusWorker(BackgroundThread):
             if self.isInterruptionRequested():
                 return
             self.done.emit(snapshot)
-            perf_log.info(
-                "perf op=git-status-worker duration_ms=%.1f files=%d status=done",
-                (time.perf_counter() - started) * 1000, len(snapshot.files),
-            )
+            duration_ms = (time.perf_counter() - started) * 1000
+            if duration_ms >= 200:
+                perf_log.info(
+                    "perf op=git-status-worker duration_ms=%.1f files=%d status=done",
+                    duration_ms, len(snapshot.files),
+                )
         except Exception as error:
             perf_log.exception("Git 状态刷新失败: %s", self.cwd)
             self.failed.emit(started_ns, str(error))

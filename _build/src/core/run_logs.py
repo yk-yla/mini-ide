@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import copy
 import re
 import uuid
 
@@ -28,6 +29,13 @@ def error_blocks(lines: list[str]) -> list[str]:
     return selected
 
 
+def _tail_offset(rows: list[tuple[int, str]], tail: int) -> int:
+    first = max(0, len(rows) - tail)
+    while first > 0 and is_continuation(rows[first][1]):
+        first -= 1
+    return first
+
+
 class RunLog:
     def __init__(self, max_chars=256000, max_lines=4000):
         self.run_id = uuid.uuid4().hex
@@ -48,6 +56,27 @@ class RunLog:
             self.characters -= len(self.rows.popleft()[1])
             self.dropped = True
 
+    def snapshot(self) -> RunLog:
+        output = copy(self)
+        output.rows = self.rows.copy()
+        return output
+
+    def latest_error_block(self, tail: int) -> list[str]:
+        rows = list(self.rows)
+        latest = []
+        active = False
+        for _, text in rows[_tail_offset(rows, tail):]:
+            if is_error(text):
+                if not active:
+                    latest = []
+                latest.append(text)
+                active = True
+            elif active and is_continuation(text):
+                latest.append(text)
+            else:
+                active = False
+        return latest
+
     def read(self, *, tail=50, cursor=0, errors=False, max_chars=30000, run_id=None):
         if run_id and run_id != self.run_id:
             return {"ok": False, "code": "run_changed", "error": "requested run is no longer current",
@@ -61,10 +90,7 @@ class RunLog:
                     first -= 1
             rows = rows[first:]
         else:
-            first = max(0, len(rows) - tail)
-            while first > 0 and is_continuation(rows[first][1]):
-                first -= 1
-            rows = rows[first:]
+            rows = rows[_tail_offset(rows, tail):]
         result = []
         used = 0
         next_cursor = cursor

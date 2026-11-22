@@ -326,11 +326,20 @@ QPushButton:focus {{ border-color: {BORDER_FOCUS}; }}
 
 QPushButton#external_tool_button {{
     background: {BG_L2};
-    border-color: {BORDER_STRONG};
+    border-color: {BORDER_SUBTLE};
     font-weight: 600;
     padding-left: 12px;
     padding-right: 12px;
 }}
+QPushButton[compact="true"], QPushButton#external_tool_button[compact="true"] {{
+    padding: {GAP_XS}px {GAP_SM}px;
+    min-height: {H_BTN_SM - GAP_XS * 2}px;
+}}
+QToolButton[compact="true"] {{
+    padding: {GAP_NONE}px;
+    border-color: transparent;
+}}
+QToolButton[compact="true"]:hover {{ border-color: {BORDER_SUBTLE}; }}
 QPushButton#external_tool_button:hover {{
     background: {ACCENT_SUBTLE};
     border-color: {ACCENT};
@@ -546,9 +555,8 @@ QScrollArea#workspace_scroll > QWidget > QWidget {{
     background: transparent;
 }}
 QFrame#workspace_card {{
-    background: {BG_CARD};
+    background: {BG_L2};
     border: 1px solid {BORDER_SUBTLE};
-    border-left: 3px solid {BORDER_STRONG};
     border-radius: {RADIUS_MD}px;
 }}
 QFrame#workspace_card:hover {{
@@ -580,7 +588,7 @@ QLabel#workspace_card_label {{ color: {FG_DIM}; }}
 QLabel#workspace_project_chip {{
     color: {FG_SECONDARY};
     background: {BG_L2};
-    border: 1px solid {BORDER_STRONG};
+    border: none;
     border-radius: {RADIUS_SM}px;
     padding: 2px 7px;
     font-size: {FONT_PT_UI_SM}pt;
@@ -591,7 +599,7 @@ QLabel#workspace_card_meta {{ color: {FG_DIM}; }}
 /* ===== 聚合项目工作台 ===== */
 QFrame#aggregate_project_sidebar {{
     background: {BG_L2};
-    border: 1px solid {BORDER_SUBTLE};
+    border: none;
     border-radius: {RADIUS_MD}px;
 }}
 QTreeWidget#aggregate_project_tree {{
@@ -599,18 +607,57 @@ QTreeWidget#aggregate_project_tree {{
     border: none;
 }}
 QTreeWidget#aggregate_project_tree::item {{
-    min-height: {H_TABLE_ROW}px;
-    padding: {GAP_SM}px {GAP_SM}px;
-    border-radius: {RADIUS_SM}px;
+    min-height: {H_TABLE_ROW - GAP_XS}px;
+    padding: {GAP_XS}px {GAP_SM}px;
 }}
 QTreeWidget#aggregate_project_tree::item:selected {{
     background: {ACCENT_SUBTLE};
-    color: {FG_BRIGHT};
 }}
 QFrame#aggregate_project_detail {{
     background: {BG_CONTENT};
     border: none;
 }}
+QFrame#service_header, QFrame#top_toolbar {{
+    background: {BG_L0};
+    border-bottom: 1px solid {BORDER_SUBTLE};
+}}
+QFrame#service_row:hover {{ background: {BG_L4}; }}
+QScrollArea#project_cockpit {{ background: {BG_L1}; border: none; }}
+QFrame#cockpit_overview {{
+    background: {BG_CARD};
+    border-radius: {RADIUS_LG}px;
+}}
+QFrame#cockpit_section {{
+    background: {BG_L2};
+    border-radius: {RADIUS_LG}px;
+}}
+QFrame#cockpit_runtime_row {{
+    background: transparent;
+    border-radius: {RADIUS_SM}px;
+}}
+QFrame#cockpit_runtime_row:hover {{ background: {BG_L4}; }}
+QFrame#cockpit_event_row[clickable="true"] {{ border-radius: {RADIUS_SM}px; }}
+QFrame#cockpit_event_row[clickable="true"]:hover {{ background: {BG_L3}; }}
+QPushButton[runtimeName="true"] {{
+    text-align: left;
+    background: transparent;
+    border-color: transparent;
+}}
+QPushButton[runtimeName="true"]:focus {{ border-color: {BORDER_FOCUS}; }}
+QLabel[role="cockpit-title"] {{
+    color: {FG_BRIGHT};
+    font-size: {FONT_PT_UI_LG + 3}pt;
+    font-weight: 600;
+}}
+QLabel[role="cockpit-chip"], QLabel[role="cockpit-event-ok"], QLabel[role="cockpit-event-error"] {{
+    background: {BG_L1};
+    border-radius: {RADIUS_SM}px;
+    font-size: {FONT_PT_UI_SM}pt;
+    padding: {GAP_XS}px {GAP_SM}px;
+}}
+QLabel[role="cockpit-chip"] {{ color: {FG_SECONDARY}; }}
+QLabel[role="cockpit-event-ok"] {{ color: {COLOR_SUCCESS}; }}
+QLabel[role="cockpit-event-error"] {{ color: {COLOR_ERROR}; }}
 QScrollArea#service_rows_scroll {{
     background: {BG_CONTENT};
     border: none;

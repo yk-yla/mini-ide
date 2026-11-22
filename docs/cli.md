@@ -26,6 +26,14 @@
 
 最多保留 64 个操作回执；运行中记录不淘汰。回执保存于当前 APPDATA 配置目录的 `cli-operations.json`，日志输出尾部有界。IDE 重启后未结束记录标为 interrupted，必须先核对实际进程、Git 或文件结果，不能根据回执重放写操作。
 
+## 用量统计
+
+`--usage-stats` 返回运行中 GUI 的本机快照，包含 `schema_version`、`counters.cli`、`counters.gui` 和 `recent_ai_events`。每项计数包含 `count`、`fail_count`、`total_ms` 和 ISO 8601 格式的 `last_used_at`。最近活动最多保留 50 条，按完成顺序排列，含 `ts`、`command`、`target`、`ok`、`duration_ms` 和 `error_code`。
+
+统计覆盖到达 GUI 的已知 CLI 命令。长操作按最终执行结果计一次，接收回执、同一请求 ID 的重放和客户端等待超时不重复计入原操作。`--operation` 查询单独计数。`--usage-stats` 在生成快照后计数，其查询记录不占最近活动列表。最近活动只保存简短目标名和预定义错误码。指定模块时优先记录模块名，驾驶舱中能定位到项目或模块的活动可以直接打开对应日志。
+
+快照由 GUI 写入当前配置目录的 `usage-stats.json`，也可通过“帮助 → 打开用量统计”打开。
+
 ## 本次运行日志和分层健康检查
 
 ~~~text
@@ -40,10 +48,20 @@
 
 隔离验证可为 GUI 与 CLI 设置同一个 `MINI_IDE_SERVER_NAME`，并给子进程设置独立 APPDATA；IPC 和启动锁随实例名隔离。日常使用保持默认值。不要把新 CLI 连接到不支持对应能力的旧 GUI 后声称新版功能已生效。
 
+## 排错现场快照
+
+`--snapshot <target> [--tail N] [--max-chars N]` 一次收集目录归属、各项目的运行状态、托管服务错误日志、Git 摘要和最近 5 条 AI CLI 活动。目标支持普通项目、聚合目录、组件和需求工作区，使用路径或唯一名称。聚合根和工作区根返回全部组件，组件目标只返回该组件。
+
+命令只读取现场。`target` 可用于确认归属，`projects[].observed` 表示项目已在 GUI 中打开。未打开项目的运行状态为 `unknown`。`health_url` 展示已配置的本地健康地址。Git 在后台读取，`changed_files` 最多返回 10 条。
+
+`--tail` 默认检查每个当前运行代次的最后 60 行，并补齐跨越边界的错误栈。每个运行单元只返回最近的错误块。`--max-chars` 默认给全部错误正文共 12,000 个字符，裁剪或环形缓冲淘汰会标记 `truncated`。
+
 ## 命令
 
 ~~~text
 --status
+--snapshot <target> [--tail N] [--max-chars N]
+--usage-stats
 --version
 --list-projects
 --list-modules <project>
